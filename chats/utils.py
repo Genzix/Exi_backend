@@ -91,6 +91,9 @@ def get_active_typers(conversation_id):
 
 
 def set_typing_status(conversation_id, user_id, is_typing):
+    from accounts.utils import get_typing_privacy
+    if is_typing and not get_typing_privacy(user_id):
+        return
     update_typing_cache(conversation_id, user_id, is_typing)
     broadcast_typing_status(conversation_id, user_id, is_typing)
 
@@ -390,12 +393,31 @@ def notify_new_message(message):
     for participant in participants:
         if participant.is_muted:
             continue
+
+        from accounts.user_preferences import (
+            is_notifications_muted,
+            get_section_preferences,
+            should_show_preview,
+        )
+
+        user_id = participant.user_id
+        if is_notifications_muted(user_id):
+            continue
+
+        notif_prefs = get_section_preferences(user_id, 'notifications')
+        if conversation.type == 'group' and not notif_prefs.get('group_alerts', True):
+            continue
+        if conversation.type == 'direct' and not notif_prefs.get('message_alerts', True):
+            continue
+
+        msg_body = body if should_show_preview(user_id) else 'New message'
+
         create_notification(
             recipient=participant.user,
             sender=sender,
             notification_type='new_message',
             title=title,
-            body=body,
+            body=msg_body,
             conversation=conversation,
             message=message,
             data={
@@ -407,6 +429,15 @@ def notify_new_message(message):
 
 
 def notify_missed_call(call):
+    from accounts.user_preferences import is_notifications_muted, get_section_preferences
+
+    if is_notifications_muted(call.callee_id):
+        return
+
+    notif_prefs = get_section_preferences(call.callee_id, 'notifications')
+    if not notif_prefs.get('call_alerts', True):
+        return
+
     title = 'Missed call'
     body = f'Missed {_sender_display_name(call.caller)} call'
     create_notification(
@@ -422,3 +453,4 @@ def notify_missed_call(call):
             'conversation_id': str(call.conversation_id),
         },
     )
+

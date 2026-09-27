@@ -105,7 +105,13 @@ class StartConversationView(APIView):
             return existing
 
         with transaction.atomic():
-            conversation = Conversation.objects.create(type="direct")
+            from accounts.user_preferences import get_section_preferences
+            chat_prefs = get_section_preferences(user.id, "chats")
+            default_timer = chat_prefs.get("default_disappearing_timer") if chat_prefs.get("apply_disappearing_to_new_chats", True) else None
+            conversation = Conversation.objects.create(
+                type="direct",
+                disappearing_duration=default_timer if default_timer else None
+            )
             ConversationParticipant.objects.create(conversation=conversation, user=user)
             ConversationParticipant.objects.create(conversation=conversation, user=other)
         return conversation
@@ -273,10 +279,26 @@ class MarkChatReadView(APIView):
             )
             participant.unread_count = 0
             participant.save(update_fields=["unread_count"])
-            Message.objects.filter(conversation_id=chat_id).exclude(
-                sender=request.user
-            ).exclude(status="read").update(status="read")
-            from .utils import get_badge_count, broadcast_badge_update
+
+            from .utils import (
+                get_badge_count,
+                broadcast_badge_update,
+                read_receipts_enabled,
+                broadcast_message_status,
+            )
+
+            share_receipt = read_receipts_enabled(request.user)
+            unread_messages = list(
+                Message.objects.filter(conversation_id=chat_id)
+                .exclude(sender=request.user)
+                .exclude(status="read")
+            )
+            if share_receipt:
+                Message.objects.filter(conversation_id=chat_id).exclude(
+                    sender=request.user
+                ).exclude(status="read").update(status="read")
+                for msg in unread_messages:
+                    broadcast_message_status(chat_id, msg.id, "read")
 
             badge = get_badge_count(request.user)
             broadcast_badge_update(request.user.id, badge)
@@ -290,6 +312,8 @@ class MarkChatReadView(APIView):
             return Response(
                 {"detail": "Conversation not found."}, status=status.HTTP_404_NOT_FOUND
             )
+
+    post = patch
 
 
 class ClearChatView(APIView):

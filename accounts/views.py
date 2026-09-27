@@ -261,16 +261,90 @@ from .serializers import (
     BlockUserSerializer,
     BlockedUserSerializer,
     ChangePasswordSerializer,
+    ChangePhoneSerializer,
     DeleteAccountSerializer,
     DeviceKeyUploadSerializer,
     DeviceRegisterSerializer,
     DeviceSerializer,
+    PhoneChangeRequestSerializer,
+    PhoneChangeVerifySerializer,
     PrivacySettingsSerializer,
+    UsernameCheckSerializer,
+    UsernameUpdateSerializer,
 )
 from .serializers import get_tokens, ProfileSerializer
 
 User = get_user_model()
 
+
+# ---------- Account: Username Management ----------
+
+class UsernameCheckView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        username = request.query_params.get("username", "")
+        serializer = UsernameCheckSerializer(data={"username": username}, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        return Response(serializer.to_representation(serializer.validated_data))
+
+    def post(self, request):
+        serializer = UsernameCheckSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        return Response(serializer.to_representation(serializer.validated_data))
+
+
+class UsernameUpdateView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        serializer = UsernameUpdateSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        return Response(ProfileSerializer(user, context={"request": request}).data)
+
+    put = post
+    patch = post
+
+
+# ---------- Account: Phone Number Management ----------
+
+class PhoneChangeRequestView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        serializer = PhoneChangeRequestSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        return Response(serializer.save())
+
+
+class PhoneChangeVerifyView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        serializer = PhoneChangeVerifySerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        return Response(ProfileSerializer(user, context={"request": request}).data)
+
+
+class ChangePhoneView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        if "otp_code" in request.data:
+            serializer = PhoneChangeVerifySerializer(data=request.data, context={"request": request})
+        else:
+            serializer = ChangePhoneSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        return Response(ProfileSerializer(user, context={"request": request}).data)
+
+    put = post
+    patch = post
+
+
+# ---------- Account: Linked Devices ----------
 
 class DeviceRegisterView(APIView):
     permission_classes = [permissions.IsAuthenticated]
@@ -300,6 +374,18 @@ class DeviceListView(generics.ListAPIView):
 
 class DeviceRemoveView(APIView):
     permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, device_id):
+        try:
+            device = UserDevice.objects.get(
+                user=request.user,
+                device_id=device_id,
+            )
+        except UserDevice.DoesNotExist:
+            return Response({'detail': 'Device not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(
+            DeviceSerializer(device, context={'current_device_id': device_id}).data
+        )
 
     def delete(self, request, device_id):
         try:
@@ -360,6 +446,8 @@ class ChangePasswordView(APIView):
         )
 
 
+# ---------- Privacy: Settings, Last Seen, Online Status, Read Receipts, Typing, Profile Photo ----------
+
 class PrivacySettingsView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -374,20 +462,24 @@ class PrivacySettingsView(APIView):
         serializer.save()
         return Response(serializer.data)
 
+    put = patch
+
+
+# ---------- Privacy: Blocked Users ----------
 
 class BlockUserView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
-    def post(self, request, user_id):
-        try:
-            blocked = User.objects.get(id=user_id)
-        except User.DoesNotExist:
-            return Response({'detail': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
-            
-        if blocked.id == request.user.id:
-            return Response({'detail': 'Cannot block yourself.'}, status=status.HTTP_400_BAD_REQUEST)
+    def post(self, request, user_id=None):
+        data = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
+        if user_id is not None:
+            data['user_id'] = user_id
 
-        reason = request.data.get('reason', '')
+        serializer = BlockUserSerializer(data=data, context={'request': request})
+        serializer.is_valid(raise_exception=True)
+        blocked = serializer.validated_data['blocked_user']
+        reason = serializer.validated_data.get('reason', '')
+
         block, created = BlockedUser.objects.get_or_create(
             blocker=request.user,
             blocked=blocked,
@@ -413,6 +505,38 @@ class BlockUserView(APIView):
 
         block.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class UnblockUserView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, user_id=None):
+        target_id = user_id or request.data.get('user_id')
+        exi_id = request.data.get('exi_id')
+        username = request.data.get('username')
+
+        blocked_user = None
+        if target_id:
+            blocked_user = User.objects.filter(id=target_id).first()
+        elif exi_id:
+            blocked_user = User.objects.filter(exi_id=exi_id).first()
+        elif username:
+            blocked_user = User.objects.filter(username__iexact=username).first()
+
+        if not blocked_user:
+            return Response({'detail': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        deleted_count, _ = BlockedUser.objects.filter(
+            blocker=request.user,
+            blocked=blocked_user,
+        ).delete()
+
+        if not deleted_count:
+            return Response({'detail': 'User is not blocked.'}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response({'detail': 'User unblocked successfully.'}, status=status.HTTP_200_OK)
+
+    delete = post
 
 
 class BlockedUserListView(generics.ListAPIView):

@@ -1,0 +1,57 @@
+{
+  "notifications": {
+    "message_alerts": true,
+    "message_sound": "default",
+    "message_vibration": "short",
+    "group_alerts": true,
+    "group_sound": "default",
+    "group_vibration": "default",
+    "call_alerts": true,
+    "call_ringtone": "default",
+    "call_vibration": "default",
+    "sounds": true,
+    "vibration": true,
+    "preview": false,
+    "mute_all": false,
+    "mute_until": null
+  },
+  "chats": {
+    "auto_backup_frequency": "daily",
+    "backup_over_wifi_only": true,
+    "include_videos": true,
+    "last_backup_at": null,
+    "last_backup_size": 0,
+    "default_disappearing_timer": 86400,
+    "apply_disappearing_to_new_chats": true,
+    "enter_is_send": true,
+    "enter_to_send": true,
+    "keep_chats_archived": true
+  },
+  "appearance": {
+    "theme_mode": "light",
+    "theme": "light",
+    "chat_theme": "ocean",
+    "accent_color": "#06B6D4",
+    "wallpaper": {
+      "preset": "gradient",
+      "color": "#1E293B",
+      "blur": 2.0,
+      "opacity": 0.9
+    },
+    "font_size": "large"
+  },
+  "storage": {
+    "auto_download_mobile": [
+      "photo",
+      "audio"
+    ],
+    "auto_download_wifi": [
+      "photo",
+      "audio",
+      "video",
+      "document"
+    ],
+    "auto_download_roaming": [],
+    "low_data_usage_calls": false
+  }
+}

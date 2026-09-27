@@ -1,3 +1,4 @@
+import re
 import secrets
 from datetime import timedelta
 
@@ -49,6 +50,7 @@ class ProfileSerializer(serializers.ModelSerializer):
         model = User
         fields = [
             "id",
+            "username",
             "email",
             "phone",
             "full_name",
@@ -111,6 +113,8 @@ class PublicProfileSerializer(PrivacyMaskedProfileMixin, serializers.ModelSerial
     class Meta:
         model = User
         fields = [
+            "id",
+            "username",
             "display_name",
             "full_name",
             "profile_photo",
@@ -351,13 +355,193 @@ class ProfileSetupSerializer(serializers.ModelSerializer):
 class ProfileUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
-        fields = ["full_name", "display_name", "profile_photo", "bio", "status_message", "is_business", "business_name", "business_address", "business_website"]
+        fields = [
+            "username",
+            "phone",
+            "full_name",
+            "display_name",
+            "profile_photo",
+            "bio",
+            "status_message",
+            "is_business",
+            "business_name",
+            "business_address",
+            "business_website",
+        ]
+
+    def validate_username(self, value):
+        if not value:
+            return value
+        value = value.strip().lower()
+        if not re.match(r"^[a-zA-Z0-9_]{3,30}$", value):
+            raise serializers.ValidationError(
+                "Username must be 3-30 characters and contain only letters, numbers, and underscores."
+            )
+        user = self.instance
+        if User.objects.filter(username__iexact=value).exclude(id=getattr(user, "id", None)).exists():
+            raise serializers.ValidationError("This username is already taken.")
+        return value
+
+    def validate_phone(self, value):
+        if not value:
+            return value
+        normalized = normalize_phone(value)
+        if len(normalized) < 8:
+            raise serializers.ValidationError("Enter a valid phone number.")
+        user = self.instance
+        if User.objects.filter(phone=normalized).exclude(id=getattr(user, "id", None)).exists():
+            raise serializers.ValidationError("This phone number is already registered.")
+        return normalized
 
     def validate_display_name(self, value):
         value = value.strip()
         if not value:
             raise serializers.ValidationError("Display name cannot be empty.")
         return value
+
+
+# ---------- Account: Username Management ----------
+
+class UsernameCheckSerializer(serializers.Serializer):
+    username = serializers.CharField(max_length=30)
+
+    def validate_username(self, value):
+        value = value.strip().lower()
+        if not re.match(r"^[a-zA-Z0-9_]{3,30}$", value):
+            raise serializers.ValidationError(
+                "Username must be 3-30 characters and contain only letters, numbers, and underscores."
+            )
+        request = self.context.get("request")
+        current_user_id = request.user.id if request and request.user.is_authenticated else None
+        is_taken = User.objects.filter(username__iexact=value).exclude(id=current_user_id).exists()
+        return value
+
+    def to_representation(self, instance):
+        username = self.validated_data.get("username", "")
+        request = self.context.get("request")
+        current_user_id = request.user.id if request and request.user.is_authenticated else None
+        is_taken = User.objects.filter(username__iexact=username).exclude(id=current_user_id).exists()
+        return {
+            "username": username,
+            "available": not is_taken,
+        }
+
+
+class UsernameUpdateSerializer(serializers.Serializer):
+    username = serializers.CharField(max_length=30)
+
+    def validate_username(self, value):
+        value = value.strip().lower()
+        if not re.match(r"^[a-zA-Z0-9_]{3,30}$", value):
+            raise serializers.ValidationError(
+                "Username must be 3-30 characters and contain only letters, numbers, and underscores."
+            )
+        request = self.context.get("request")
+        current_user = request.user if request else None
+        if User.objects.filter(username__iexact=value).exclude(id=getattr(current_user, "id", None)).exists():
+            raise serializers.ValidationError("This username is already taken.")
+        return value
+
+    def save(self):
+        user = self.context["request"].user
+        user.username = self.validated_data["username"]
+        user.save(update_fields=["username"])
+        return user
+
+
+# ---------- Account: Phone Number Management ----------
+
+class PhoneChangeRequestSerializer(serializers.Serializer):
+    new_phone = serializers.CharField(max_length=20)
+
+    def validate_new_phone(self, value):
+        phone = normalize_phone(value)
+        if len(phone) < 8:
+            raise serializers.ValidationError("Enter a valid phone number.")
+        request = self.context.get("request")
+        current_user = request.user if request else None
+        if User.objects.filter(phone=phone).exclude(id=getattr(current_user, "id", None)).exists():
+            raise serializers.ValidationError("Phone number already registered to another account.")
+        return phone
+
+    def save(self):
+        phone = self.validated_data["new_phone"]
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        expires = timezone.now() + timedelta(minutes=10)
+        OTPVerification.objects.update_or_create(
+            email_or_phone=phone,
+            defaults={
+                "otp_code": make_password(code),
+                "expires_at": expires,
+                "is_verified": False,
+                "attempts": 0,
+            },
+        )
+        print(f"[phone change OTP] phone={phone} code={code}")
+        response_data = {"detail": "Verification code sent to new phone number."}
+        if django_settings.DEBUG:
+            response_data["code"] = code
+        return response_data
+
+
+class PhoneChangeVerifySerializer(serializers.Serializer):
+    new_phone = serializers.CharField(max_length=20)
+    otp_code = serializers.CharField(max_length=6)
+
+    def validate(self, data):
+        phone = normalize_phone(data["new_phone"])
+        code = str(data["otp_code"]).strip()
+        data["new_phone"] = phone
+
+        try:
+            otp_obj = OTPVerification.objects.get(email_or_phone=phone)
+        except OTPVerification.DoesNotExist:
+            raise serializers.ValidationError({"otp_code": "No verification requested for this phone number."})
+
+        if otp_obj.expires_at < timezone.now():
+            raise serializers.ValidationError({"otp_code": "Verification code has expired."})
+
+        if not check_hash(code, otp_obj.otp_code):
+            otp_obj.attempts += 1
+            otp_obj.save(update_fields=["attempts"])
+            raise serializers.ValidationError({"otp_code": "Invalid verification code."})
+
+        data["otp_obj"] = otp_obj
+        return data
+
+    def save(self):
+        user = self.context["request"].user
+        phone = self.validated_data["new_phone"]
+        user.phone = phone
+        user.save(update_fields=["phone"])
+        self.validated_data["otp_obj"].delete()
+        return user
+
+
+class ChangePhoneSerializer(serializers.Serializer):
+    new_phone = serializers.CharField(max_length=20)
+    password = serializers.CharField(write_only=True, required=False)
+
+    def validate(self, data):
+        phone = normalize_phone(data["new_phone"])
+        if len(phone) < 8:
+            raise serializers.ValidationError({"new_phone": "Enter a valid phone number."})
+        user = self.context["request"].user
+        if User.objects.filter(phone=phone).exclude(id=user.id).exists():
+            raise serializers.ValidationError({"new_phone": "Phone number already in use."})
+        
+        password = data.get("password")
+        if password and not user.check_password(password):
+            raise serializers.ValidationError({"password": "Password is incorrect."})
+            
+        data["new_phone"] = phone
+        return data
+
+    def save(self):
+        user = self.context["request"].user
+        user.phone = self.validated_data["new_phone"]
+        user.save(update_fields=["phone"])
+        return user
 
 
 class OnlineStatusSerializer(serializers.Serializer):
@@ -505,6 +689,14 @@ class ChangePasswordSerializer(serializers.Serializer):
 
 
 class PrivacySettingsSerializer(serializers.ModelSerializer):
+    show_typing_status = serializers.BooleanField(required=False)
+    # Aliases
+    last_seen_visibility = serializers.CharField(required=False, write_only=True)
+    online_status_visibility = serializers.CharField(required=False, write_only=True)
+    profile_photo_visibility = serializers.CharField(required=False, write_only=True)
+    typing_indicator_enabled = serializers.BooleanField(required=False, write_only=True)
+    read_receipts = serializers.BooleanField(required=False, write_only=True)
+
     class Meta:
         model = UserPrivacySettings
         fields = [
@@ -514,12 +706,73 @@ class PrivacySettingsSerializer(serializers.ModelSerializer):
             'allow_calls_from',
             'allow_messages_from',
             'read_receipts_enabled',
+            'show_typing_status',
             'searchable',
             'push_notifications_enabled',
             'in_app_notifications_enabled',
             'updated_at',
+            # Aliases
+            'last_seen_visibility',
+            'online_status_visibility',
+            'profile_photo_visibility',
+            'typing_indicator_enabled',
+            'read_receipts',
         ]
         read_only_fields = ['updated_at']
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        from .utils import get_typing_privacy
+        ret['show_typing_status'] = get_typing_privacy(instance.user)
+        ret['last_seen_visibility'] = 'everyone' if instance.show_last_seen else 'nobody'
+        ret['online_status_visibility'] = 'everyone' if instance.show_online_status else 'nobody'
+        ret['profile_photo_visibility'] = 'everyone' if instance.show_profile_photo else 'nobody'
+        ret['typing_indicator_enabled'] = ret['show_typing_status']
+        ret['read_receipts'] = instance.read_receipts_enabled
+        return ret
+
+    def to_internal_value(self, data):
+        data_copy = data.copy() if hasattr(data, 'copy') else dict(data)
+
+        if 'last_seen_visibility' in data_copy:
+            val = str(data_copy['last_seen_visibility']).lower()
+            data_copy['show_last_seen'] = val in ('everyone', 'true', '1')
+        elif 'show_last_seen' in data_copy and isinstance(data_copy['show_last_seen'], str):
+            val = data_copy['show_last_seen'].lower()
+            data_copy['show_last_seen'] = val in ('everyone', 'true', '1')
+
+        if 'online_status_visibility' in data_copy:
+            val = str(data_copy['online_status_visibility']).lower()
+            data_copy['show_online_status'] = val in ('everyone', 'true', '1')
+        elif 'show_online_status' in data_copy and isinstance(data_copy['show_online_status'], str):
+            val = data_copy['show_online_status'].lower()
+            data_copy['show_online_status'] = val in ('everyone', 'true', '1')
+
+        if 'profile_photo_visibility' in data_copy:
+            val = str(data_copy['profile_photo_visibility']).lower()
+            data_copy['show_profile_photo'] = val in ('everyone', 'true', '1')
+        elif 'show_profile_photo' in data_copy and isinstance(data_copy['show_profile_photo'], str):
+            val = data_copy['show_profile_photo'].lower()
+            data_copy['show_profile_photo'] = val in ('everyone', 'true', '1')
+
+        if 'read_receipts' in data_copy and 'read_receipts_enabled' not in data_copy:
+            data_copy['read_receipts_enabled'] = data_copy['read_receipts']
+
+        if 'typing_indicator_enabled' in data_copy and 'show_typing_status' not in data_copy:
+            data_copy['show_typing_status'] = data_copy['typing_indicator_enabled']
+
+        return super().to_internal_value(data_copy)
+
+    def update(self, instance, validated_data):
+        from .utils import set_typing_privacy
+        if 'show_typing_status' in validated_data:
+            set_typing_privacy(instance.user, validated_data.pop('show_typing_status'))
+        validated_data.pop('last_seen_visibility', None)
+        validated_data.pop('online_status_visibility', None)
+        validated_data.pop('profile_photo_visibility', None)
+        validated_data.pop('typing_indicator_enabled', None)
+        validated_data.pop('read_receipts', None)
+        return super().update(instance, validated_data)
 
 
 # ---------- End-to-end encryption key bundles ----------
@@ -557,19 +810,32 @@ class DeviceKeyUploadSerializer(serializers.Serializer):
 
 
 class BlockUserSerializer(serializers.Serializer):
-    exi_id = serializers.CharField()
+    user_id = serializers.IntegerField(required=False)
+    exi_id = serializers.CharField(required=False)
+    username = serializers.CharField(required=False)
     reason = serializers.CharField(required=False, allow_blank=True, max_length=255)
 
-    def validate_exi_id(self, value):
-        request = self.context['request']
-        try:
-            blocked = User.objects.get(exi_id=value)
-        except User.DoesNotExist:
+    def validate(self, data):
+        request = self.context.get('request')
+        user_id = data.get('user_id')
+        exi_id = data.get('exi_id')
+        username = data.get('username')
+
+        blocked = None
+        if user_id:
+            blocked = User.objects.filter(id=user_id).first()
+        elif exi_id:
+            blocked = User.objects.filter(exi_id=exi_id).first()
+        elif username:
+            blocked = User.objects.filter(username__iexact=username).first()
+
+        if not blocked:
             raise serializers.ValidationError('User not found.')
-        if blocked.id == request.user.id:
+        if request and blocked.id == request.user.id:
             raise serializers.ValidationError('You cannot block yourself.')
         self.context['blocked_user'] = blocked
-        return value
+        data['blocked_user'] = blocked
+        return data
 
 
 class BlockedUserSerializer(serializers.ModelSerializer):

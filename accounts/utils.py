@@ -128,6 +128,36 @@ def clear_login_failures(identifier):
 
 # ---------- Privacy controls ----------
 
+def is_user_blocked(user_a, user_b):
+    """True if either user has blocked the other."""
+    if not user_a or not user_b:
+        return False
+    from .models import BlockedUser
+    from django.db.models import Q
+    return BlockedUser.objects.filter(
+        Q(blocker=user_a, blocked=user_b) | Q(blocker=user_b, blocked=user_a)
+    ).exists()
+
+
+def get_typing_privacy(user):
+    """Returns True if typing indicator is enabled for the user, False otherwise."""
+    if not user:
+        return True
+    user_id = getattr(user, "id", user)
+    val = cache.get(f"privacy:typing:{user_id}")
+    if val is not None:
+        return bool(val)
+    return True
+
+
+def set_typing_privacy(user, enabled):
+    """Save user typing status privacy setting."""
+    if not user:
+        return
+    user_id = getattr(user, "id", user)
+    cache.set(f"privacy:typing:{user_id}", bool(enabled), timeout=None)
+
+
 def are_contacts(user_a, user_b):
     """Two users are contacts when they already share a direct conversation."""
     if not user_a or not user_b or user_a.id == user_b.id:
@@ -162,17 +192,27 @@ def visibility_allows(owner, viewer, setting_value):
 
 def can_message(sender, recipient):
     """Whether `sender` is allowed to start/continue a chat with `recipient`."""
+    if is_user_blocked(sender, recipient):
+        return False
     prefs = privacy_settings_or_default(recipient)
     return visibility_allows(recipient, sender, prefs.allow_messages_from)
 
 
 def can_call(caller, callee):
+    if is_user_blocked(caller, callee):
+        return False
     prefs = privacy_settings_or_default(callee)
     return visibility_allows(callee, caller, prefs.allow_calls_from)
 
 
 def visible_profile_fields(owner, viewer):
     """Which optional profile fields `viewer` may see on `owner`'s profile."""
+    if viewer is not None and getattr(viewer, 'id', None) and is_user_blocked(owner, viewer):
+        return {
+            'online_status': False,
+            'last_seen': False,
+            'profile_photo': False,
+        }
     prefs = privacy_settings_or_default(owner)
     return {
         'online_status': visibility_allows(
