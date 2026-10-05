@@ -22,6 +22,7 @@ from .views import (
     SendMediaMessageView,
     DownloadAttachmentView,
     MessageStatusUpdateView,
+    MessageEditDeleteView,
     MediaUploadUrlView,
     MediaBinaryUploadView,
     MediaCompleteView,
@@ -53,6 +54,23 @@ from .views import (
     MessageDraftDetailView,
     ScheduledMessageListView,
 )
+from .group_views import (
+    CreateGroupView,
+    GroupInfoView,
+    GroupMembersView,
+    GroupMemberRemoveView,
+    GroupPermissionsView,
+    GroupInviteLinkView,
+    JoinViaInviteView,
+    GroupAdminControlsView,
+    GroupLeaveView,
+    GroupDismissView,
+    FavoriteChatsView,
+    FavoriteChatToggleView,
+    ChatListsView,
+    ChatListDetailView,
+    ChatListChatsView,
+)
 
 urlpatterns = [
     path("chats/", RecentConversationsView.as_view()),
@@ -60,6 +78,13 @@ urlpatterns = [
     path("chats/search/", SearchChatsView.as_view()),
     path("chats/users/search/", SearchUsersView.as_view()),
     path("chats/unread-count/", TotalUnreadCountView.as_view()),
+
+    # Favorites & Chat Lists
+    path("chats/favorites/", FavoriteChatsView.as_view()),
+    path("chats/lists/", ChatListsView.as_view()),
+    path("chats/lists/<str:list_id>/", ChatListDetailView.as_view()),
+    path("chats/lists/<str:list_id>/chats/", ChatListChatsView.as_view()),
+
     path("chats/<uuid:chat_id>/", ChatDetailsView.as_view()),
     path("chats/<uuid:chat_id>/pin/", PinChatView.as_view()),
     path("chats/<uuid:chat_id>/archive/", ArchiveChatView.as_view()),
@@ -71,6 +96,7 @@ urlpatterns = [
     path("chats/report/", ReportUserView.as_view()),
     path("chats/<uuid:chat_id>/read/", MarkChatReadView.as_view()),
     path("chats/<uuid:chat_id>/typing/", TypingIndicatorView.as_view()),
+    path("chats/<uuid:chat_id>/favorite/", FavoriteChatToggleView.as_view()),
 
     # Message Endpoints
     path("chats/<uuid:chat_id>/messages/", MessageListView.as_view()),
@@ -84,6 +110,7 @@ urlpatterns = [
         name="message-attachment-download",
     ),
     path("messages/<uuid:message_id>/status/", MessageStatusUpdateView.as_view()),
+    path("messages/<uuid:message_id>/", MessageEditDeleteView.as_view()),
     path("messages/<uuid:message_id>/reaction/", MessageReactionView.as_view()),
     path("messages/<uuid:message_id>/star/", MessageStarView.as_view()),
     path("messages/starred/", StarredMessageListView.as_view()),
@@ -131,4 +158,16 @@ urlpatterns = [
     path("calls/<uuid:call_id>/cancel/", CancelCallView.as_view()),
     path("calls/<uuid:call_id>/end/", EndCallView.as_view()),
     path("calls/<uuid:call_id>/signal/", CallSignalView.as_view()),
+
+    # Group Chat
+    path("groups/", CreateGroupView.as_view()),
+    path("groups/join/", JoinViaInviteView.as_view()),
+    path("groups/<uuid:group_id>/", GroupInfoView.as_view()),
+    path("groups/<uuid:group_id>/dismiss/", GroupDismissView.as_view()),
+    path("groups/<uuid:group_id>/leave/", GroupLeaveView.as_view()),
+    path("groups/<uuid:group_id>/members/", GroupMembersView.as_view()),
+    path("groups/<uuid:group_id>/members/<int:user_id>/", GroupMemberRemoveView.as_view()),
+    path("groups/<uuid:group_id>/permissions/", GroupPermissionsView.as_view()),
+    path("groups/<uuid:group_id>/invite/", GroupInviteLinkView.as_view()),
+    path("groups/<uuid:group_id>/admins/", GroupAdminControlsView.as_view()),
 ]

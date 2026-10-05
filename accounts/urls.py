@@ -58,9 +58,44 @@ from .settings_views import (
     StorageSettingsView,
     StorageUsageView,
     StorageChatsView,
+    ManageStorageView,
+    ManageStorageCategoryView,
+    ManageStorageDeleteView,
     StorageLargeFilesView,
     StorageLargeFilesDeleteView,
     StorageClearMediaView,
+    StorageClearMediaPreviewView,
+)
+from .extra_views import (
+    # Security
+    AppLockSettingsView,
+    AppLockPinSetView,
+    AppLockPinVerifyView,
+    TwoStepVerificationView,
+    SecurityNotificationsView,
+    UnknownCallerProtectionView,
+    # Call settings
+    CallNotificationsView,
+    # Discovery
+    NearbyPlacesView,
+    NearbyBusinessesView,
+    DiscoveryEventsView,
+    DiscoveryOffersView,
+    AIRecommendationsView,
+    # Business
+    BusinessProfileView,
+    BusinessSetupView,
+    BusinessProductsView,
+    BusinessProductDetailView,
+    BusinessOffersView,
+    BusinessCustomerChatView,
+    # Help
+    HelpCenterView,
+    HelpArticleView,
+    ReportProblemView,
+    ContactSupportView,
+    TermsView,
+    PrivacyPolicyView,
 )
 
 urlpatterns = [
@@ -113,6 +148,20 @@ urlpatterns = [
     path("privacy/", PrivacySettingsView.as_view()),
     path("account/privacy/", PrivacySettingsView.as_view()),
 
+    # Security — App Lock
+    path("security/app-lock/", AppLockSettingsView.as_view()),
+    path("security/app-lock/pin/", AppLockPinSetView.as_view()),
+    path("security/app-lock/verify/", AppLockPinVerifyView.as_view()),
+
+    # Security — Two-Step Verification
+    path("security/two-step/", TwoStepVerificationView.as_view()),
+
+    # Security — Notifications
+    path("security/notifications/", SecurityNotificationsView.as_view()),
+
+    # Security — Unknown Caller Protection
+    path("security/unknown-caller/", UnknownCallerProtectionView.as_view()),
+
     # Blocked Users
     path("users/block/", BlockUserView.as_view()),
     path("users/unblock/", UnblockUserView.as_view()),
@@ -125,7 +174,7 @@ urlpatterns = [
     path("privacy/unblock/", UnblockUserView.as_view()),
     path("privacy/unblock/<int:user_id>/", UnblockUserView.as_view()),
 
-    # Security
+    # Security — Account
     path("security/change-password/", ChangePasswordView.as_view()),
     path("security/deactivate/", DeactivateAccountView.as_view()),
     path("security/delete-account/", DeleteAccountView.as_view()),
@@ -163,11 +212,42 @@ urlpatterns = [
     # Appearance Settings
     path("settings/appearance/", AppearanceSettingsView.as_view()),
 
-    # Storage Settings & Management
+    # Storage Settings & Management (10.1 - 10.5)
     path("settings/storage/", StorageSettingsView.as_view()),
+    path("settings/storage/auto-download/", StorageSettingsView.as_view()),
     path("settings/storage/usage/", StorageUsageView.as_view()),
     path("settings/storage/chats/", StorageChatsView.as_view()),
+    path("settings/storage/manage/", ManageStorageView.as_view()),
+    path("settings/storage/manage/category/", ManageStorageCategoryView.as_view()),
+    path("settings/storage/manage/delete/", ManageStorageDeleteView.as_view()),
     path("settings/storage/large-files/", StorageLargeFilesView.as_view()),
     path("settings/storage/large-files/delete/", StorageLargeFilesDeleteView.as_view()),
     path("settings/storage/clear-media/", StorageClearMediaView.as_view()),
+    path("settings/storage/clear-media/preview/", StorageClearMediaPreviewView.as_view()),
+
+    # Call Settings (Notifications & Low Data Mode)
+    path("settings/calls/", CallNotificationsView.as_view()),
+
+    # Discovery
+    path("discovery/nearby/", NearbyPlacesView.as_view()),
+    path("discovery/businesses/", NearbyBusinessesView.as_view()),
+    path("discovery/events/", DiscoveryEventsView.as_view()),
+    path("discovery/offers/", DiscoveryOffersView.as_view()),
+    path("discovery/ai-recommendations/", AIRecommendationsView.as_view()),
+
+    # Business
+    path("business/setup/", BusinessSetupView.as_view()),
+    path("business/profile/", BusinessProfileView.as_view()),
+    path("business/products/", BusinessProductsView.as_view()),
+    path("business/products/<str:product_id>/", BusinessProductDetailView.as_view()),
+    path("business/offers/", BusinessOffersView.as_view()),
+    path("business/customer-chat/", BusinessCustomerChatView.as_view()),
+
+    # Help Center
+    path("help/", HelpCenterView.as_view()),
+    path("help/articles/<str:article_id>/", HelpArticleView.as_view()),
+    path("help/report-problem/", ReportProblemView.as_view()),
+    path("help/contact/", ContactSupportView.as_view()),
+    path("help/terms/", TermsView.as_view()),
+    path("help/privacy/", PrivacyPolicyView.as_view()),
 ]
