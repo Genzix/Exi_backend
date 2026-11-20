@@ -159,17 +159,30 @@ def set_typing_privacy(user, enabled):
 
 
 def are_contacts(user_a, user_b):
-    """Two users are contacts when they already share a direct conversation."""
+    """Two users are contacts when they share a direct conversation or are in address book contacts."""
     if not user_a or not user_b or user_a.id == user_b.id:
         return False
 
     from chats.models import Conversation
 
-    return (
+    if (
         Conversation.objects.filter(type='direct', participants=user_a)
         .filter(participants=user_b)
         .exists()
-    )
+    ):
+        return True
+
+    # Also check saved address book / contacts in user_preferences
+    from accounts.user_preferences import get_section_preferences
+    for owner, other in [(user_a, user_b), (user_b, user_a)]:
+        other_phone = getattr(other, 'phone', None)
+        if other_phone:
+            c_prefs = get_section_preferences(owner.id, "contacts")
+            contact_list = c_prefs.get("contact_list", []) if c_prefs else []
+            if any(c.get("phone_number") == other_phone for c in contact_list if isinstance(c, dict)):
+                return True
+
+    return False
 
 
 def privacy_settings_or_default(user):
@@ -195,35 +208,76 @@ def can_message(sender, recipient):
     if is_user_blocked(sender, recipient):
         return False
     prefs = privacy_settings_or_default(recipient)
-    return visibility_allows(recipient, sender, prefs.allow_messages_from)
+    if not visibility_allows(recipient, sender, prefs.allow_messages_from):
+        return False
+
+    # Check Message Requests privacy setting:
+    # "Message Requests - if turned off, people who are not your contacts cannot start a chat with you"
+    from accounts.user_preferences import get_section_preferences
+    recipient_privacy = get_section_preferences(recipient.id, "privacy") or {}
+    if not recipient_privacy.get("message_requests", True):
+        if not are_contacts(recipient, sender):
+            return False
+
+    return True
 
 
 def can_call(caller, callee):
     if is_user_blocked(caller, callee):
         return False
-    prefs = privacy_settings_or_default(callee)
-    return visibility_allows(callee, caller, prefs.allow_calls_from)
+    from accounts.user_preferences import get_section_preferences
+    call_prefs = get_section_preferences(callee.id, "calls") or {}
+    db_prefs = privacy_settings_or_default(callee)
+    setting = call_prefs.get("who_can_call", call_prefs.get("allow_calls_from", db_prefs.allow_calls_from or "everyone"))
+    return visibility_allows(callee, caller, setting)
 
 
 def visible_profile_fields(owner, viewer):
     """Which optional profile fields `viewer` may see on `owner`'s profile."""
+    from accounts.user_preferences import get_section_preferences
+
     if viewer is not None and getattr(viewer, 'id', None) and is_user_blocked(owner, viewer):
         return {
             'online_status': False,
             'last_seen': False,
             'profile_photo': False,
+            'exi_id': False,
+            'bio': False,
         }
+
     prefs = privacy_settings_or_default(owner)
+    user_prefs = get_section_preferences(owner.id, "privacy") or {}
+
+    # Online status (with same_as_last_seen support)
+    online_setting = user_prefs.get("online_status", "everyone")
+    last_seen_setting = user_prefs.get("last_seen", "everyone" if prefs.show_last_seen else "nobody")
+
+    if online_setting == "same_as_last_seen":
+        online_allowed = visibility_allows(owner, viewer, last_seen_setting)
+    else:
+        online_allowed = visibility_allows(
+            owner, viewer, "everyone" if prefs.show_online_status and online_setting == "everyone" else online_setting
+        )
+
+    last_seen_allowed = visibility_allows(owner, viewer, last_seen_setting)
+    photo_allowed = visibility_allows(
+        owner, viewer, user_prefs.get("profile_photo", "everyone" if prefs.show_profile_photo else "nobody")
+    )
+
+    # Show EXI ID on profile (if False, hidden from profile when viewed by others)
+    is_self = (viewer is not None and getattr(viewer, 'id', None) == owner.id)
+    show_exi_id = user_prefs.get("show_exi_id_on_profile", True)
+    exi_id_allowed = True if is_self else show_exi_id
+
+    # About / Bio
+    about_allowed = visibility_allows(owner, viewer, user_prefs.get("about", "everyone"))
+
     return {
-        'online_status': visibility_allows(
-            owner, viewer, 'everyone' if prefs.show_online_status else 'nobody'
-        ),
-        'last_seen': visibility_allows(
-            owner, viewer, 'everyone' if prefs.show_last_seen else 'nobody'
-        ),
-        'profile_photo': visibility_allows(
-            owner, viewer, 'everyone' if prefs.show_profile_photo else 'nobody'
-        ),
+        'online_status': online_allowed,
+        'last_seen': last_seen_allowed,
+        'profile_photo': photo_allowed,
+        'exi_id': exi_id_allowed,
+        'bio': about_allowed,
     }
 
 

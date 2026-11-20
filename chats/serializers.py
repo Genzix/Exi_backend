@@ -17,9 +17,15 @@ MEDIA_MAX_FILE_SIZES = {
 }
 
 class ParticipantUserSerializer(PrivacyMaskedProfileMixin, serializers.ModelSerializer):
+    live_note = serializers.SerializerMethodField()
+
     class Meta:
         model = User
-        fields = ['exi_id', 'full_name', 'display_name', 'profile_photo', 'is_online', 'last_seen']
+        fields = ['exi_id', 'full_name', 'display_name', 'profile_photo', 'is_online', 'last_seen', 'live_note']
+
+    def get_live_note(self, obj):
+        from accounts.live_notes import get_live_note
+        return get_live_note(obj.id)
 
 
 class MessagePreviewSerializer(serializers.ModelSerializer):
@@ -57,9 +63,11 @@ class RecentConversationSerializer(serializers.ModelSerializer):
     conversation_id = serializers.UUIDField(source='conversation.id', read_only=True)
     type = serializers.CharField(source='conversation.type', read_only=True)
     updated_at = serializers.DateTimeField(source='conversation.updated_at', read_only=True)
+    disappearing_duration = serializers.IntegerField(source='conversation.disappearing_duration', read_only=True, allow_null=True)
     
     participants = serializers.SerializerMethodField()
     last_message = serializers.SerializerMethodField()
+    permissions = serializers.SerializerMethodField()
 
     class Meta:
         model = ConversationParticipant
@@ -71,9 +79,17 @@ class RecentConversationSerializer(serializers.ModelSerializer):
             'is_muted',
             'unread_count', 
             'updated_at', 
+            'disappearing_duration',
             'participants', 
-            'last_message'
+            'last_message',
+            'permissions',
         ]
+
+    def get_permissions(self, obj):
+        from .chat_permissions import get_chat_permissions_display
+        cid = getattr(obj, 'conversation_id', getattr(obj, 'id', None))
+        uid = getattr(obj, 'user_id', None)
+        return get_chat_permissions_display(cid, uid)
 
     def get_participants(self, obj):
         # In a real app, you'd want to use prefetch_related and avoid queries in loop.
@@ -82,7 +98,15 @@ class RecentConversationSerializer(serializers.ModelSerializer):
         return ParticipantUserSerializer(users, many=True).data
 
     def get_last_message(self, obj):
-        msg = obj.conversation.messages.order_by('-created_at').first()
+        from django.utils import timezone
+        from datetime import timedelta
+        qs = obj.conversation.messages.all()
+        if obj.cleared_at:
+            qs = qs.filter(created_at__gt=obj.cleared_at)
+        if obj.conversation.disappearing_duration:
+            expired_time = timezone.now() - timedelta(seconds=obj.conversation.disappearing_duration)
+            qs = qs.filter(created_at__gte=expired_time)
+        msg = qs.order_by('-created_at').first()
         if msg:
             return MessagePreviewSerializer(msg).data
         return None
@@ -103,6 +127,8 @@ class MessageSerializer(serializers.ModelSerializer):
     media_id = serializers.UUIDField(source='media.id', read_only=True, allow_null=True)
     reactions = MessageReactionSerializer(many=True, read_only=True)
     is_starred = serializers.SerializerMethodField()
+    expires_at = serializers.SerializerMethodField()
+    is_disappearing = serializers.SerializerMethodField()
 
     class Meta:
         model = Message
@@ -111,7 +137,8 @@ class MessageSerializer(serializers.ModelSerializer):
             'attachment_name', 'attachment_mime_type', 'attachment_size',
             'download_url', 'status', 'created_at',
             'is_encrypted', 'ciphertext', 'encryption_version', 'sender_device_id',
-            'reactions', 'is_starred', 'forwarded_from', 'scheduled_for', 'is_scheduled'
+            'reactions', 'is_starred', 'forwarded_from', 'scheduled_for', 'is_scheduled',
+            'expires_at', 'is_disappearing'
         ]
 
     def get_download_url(self, obj):
@@ -130,7 +157,16 @@ class MessageSerializer(serializers.ModelSerializer):
             return StarredMessage.objects.filter(message=obj, user=request.user).exists()
         return False
 
-        return data
+    def get_expires_at(self, obj):
+        conv = getattr(obj, 'conversation', None)
+        if conv and conv.disappearing_duration and obj.created_at:
+            from datetime import timedelta
+            return obj.created_at + timedelta(seconds=conv.disappearing_duration)
+        return None
+
+    def get_is_disappearing(self, obj):
+        conv = getattr(obj, 'conversation', None)
+        return bool(conv and conv.disappearing_duration)
 
 
 class SendMessageSerializer(serializers.Serializer):
@@ -358,8 +394,27 @@ class InitiateCallSerializer(serializers.Serializer):
         if active_call:
             raise serializers.ValidationError('You already have an active or ringing call.')
 
+        # Check Callee Call Waiting setting:
+        from accounts.user_preferences import get_section_preferences
+        callee_call_prefs = get_section_preferences(callee.id, "calls") or {}
+        call_waiting_enabled = callee_call_prefs.get("call_waiting", True)
+
+        callee_in_call = Call.objects.filter(
+            status__in=['ringing', 'active'],
+        ).filter(
+            models.Q(caller=callee) | models.Q(callee=callee)
+        ).exists()
+
+        if callee_in_call and not call_waiting_enabled:
+            raise serializers.ValidationError({'chat_id': 'User is currently on another call.'})
+
         from accounts.utils import can_call
         from .utils import is_blocked
+        from .chat_permissions import check_chat_call_permission
+
+        call_allowed, call_err = check_chat_call_permission(participant.conversation_id, request.user.id, callee.id)
+        if not call_allowed:
+            raise serializers.ValidationError({'chat_id': call_err})
 
         if is_blocked(request.user, callee):
             raise serializers.ValidationError({'chat_id': 'Cannot call this user.'})
@@ -392,6 +447,9 @@ class CallSerializer(serializers.ModelSerializer):
     callee = PublicProfileSerializer(read_only=True)
     conversation_id = serializers.UUIDField(source='conversation.id', read_only=True)
     signaling_url = serializers.SerializerMethodField()
+    is_silenced = serializers.SerializerMethodField()
+    video_quality = serializers.SerializerMethodField()
+    low_data_mode = serializers.SerializerMethodField()
 
     class Meta:
         model = Call
@@ -399,6 +457,7 @@ class CallSerializer(serializers.ModelSerializer):
             'id', 'conversation_id', 'call_type', 'status',
             'caller', 'callee', 'started_at', 'answered_at',
             'ended_at', 'duration_seconds', 'signaling_url',
+            'is_silenced', 'video_quality', 'low_data_mode',
         ]
         read_only_fields = fields
 
@@ -411,6 +470,24 @@ class CallSerializer(serializers.ModelSerializer):
         ws_scheme = 'wss' if request.is_secure() else 'ws'
         host = request.get_host()
         return f'{ws_scheme}://{host}/ws/calls/{obj.id}/'
+
+    def get_is_silenced(self, obj):
+        from accounts.user_preferences import get_section_preferences
+        from accounts.utils import are_contacts
+        callee_call_prefs = get_section_preferences(obj.callee_id, "calls") or {}
+        if callee_call_prefs.get("silence_unknown_callers", False):
+            return not are_contacts(obj.caller, obj.callee)
+        return False
+
+    def get_video_quality(self, obj):
+        from accounts.user_preferences import get_section_preferences
+        callee_call_prefs = get_section_preferences(obj.callee_id, "calls") or {}
+        return callee_call_prefs.get("video_quality", "auto")
+
+    def get_low_data_mode(self, obj):
+        from accounts.user_preferences import get_section_preferences
+        callee_call_prefs = get_section_preferences(obj.callee_id, "calls") or {}
+        return bool(callee_call_prefs.get("low_data_mode", False))
 
 
 class ReportSerializer(serializers.ModelSerializer):

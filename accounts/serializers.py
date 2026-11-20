@@ -46,6 +46,8 @@ def split_email_or_phone(value):
 # ---------- Profile responses ----------
 
 class ProfileSerializer(serializers.ModelSerializer):
+    live_note = serializers.SerializerMethodField()
+
     class Meta:
         model = User
         fields = [
@@ -61,6 +63,7 @@ class ProfileSerializer(serializers.ModelSerializer):
             "last_seen",
             "bio",
             "status_message",
+            "live_note",
             "is_business",
             "business_name",
             "business_address",
@@ -70,16 +73,19 @@ class ProfileSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = fields
 
+    def get_live_note(self, obj):
+        from .live_notes import get_live_note
+        return get_live_note(obj.id)
 
-class PrivacyMaskedProfileMixin:
-    """Hides online status, last seen, and photo per the profile owner's settings.
 
-    Declare the masked fields as SerializerMethodField on the serializer using it.
-    """
+class PrivacyMaskedProfileMixin(serializers.Serializer):
+    """Hides online status, last seen, photo, exi_id, and bio per the profile owner's settings."""
 
     profile_photo = serializers.SerializerMethodField()
     is_online = serializers.SerializerMethodField()
     last_seen = serializers.SerializerMethodField()
+    exi_id = serializers.SerializerMethodField()
+    bio = serializers.SerializerMethodField()
 
     def _visible(self, obj):
         from .utils import visible_profile_fields
@@ -106,9 +112,16 @@ class PrivacyMaskedProfileMixin:
     def get_last_seen(self, obj):
         return obj.last_seen if self._visible(obj)["last_seen"] else None
 
+    def get_exi_id(self, obj):
+        return obj.exi_id if self._visible(obj).get("exi_id", True) else None
+
+    def get_bio(self, obj):
+        return obj.bio if self._visible(obj).get("bio", True) else ""
+
 
 class PublicProfileSerializer(PrivacyMaskedProfileMixin, serializers.ModelSerializer):
     """Public view of a profile, masked according to the owner's privacy settings."""
+    live_note = serializers.SerializerMethodField()
 
     class Meta:
         model = User
@@ -123,11 +136,16 @@ class PublicProfileSerializer(PrivacyMaskedProfileMixin, serializers.ModelSerial
             "last_seen",
             "bio",
             "status_message",
+            "live_note",
             "is_business",
             "business_name",
             "business_address",
             "business_website",
         ]
+
+    def get_live_note(self, obj):
+        from .live_notes import get_live_note
+        return get_live_note(obj.id)
 
 
 # ---------- Screen 1: Login ----------
@@ -272,6 +290,12 @@ class RegisterSerializer(serializers.Serializer):
     password = serializers.CharField(write_only=True, min_length=8)
     password_confirm = serializers.CharField(write_only=True)
 
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, 'copy') else dict(data)
+        if 'email_or_phone' not in data or not data.get('email_or_phone'):
+            data['email_or_phone'] = data.get('email') or data.get('phone') or ''
+        return super().to_internal_value(data)
+
     def validate_full_name(self, value):
         value = value.strip()
         if len(value) < 2:
@@ -316,6 +340,7 @@ class RegisterSerializer(serializers.Serializer):
             email=data["email"],
             phone=data["phone"],
             full_name=data["full_name"],
+            display_name=self.initial_data.get("display_name", "") or data["full_name"],
             username=data["email"] or data["phone"],
         )
         user.set_password(data["password"])

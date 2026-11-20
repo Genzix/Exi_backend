@@ -75,7 +75,14 @@ def _save_group_meta(group_id, data):
         pass
 
 
-def _default_group_meta(name, owner_id, description=""):
+def _default_group_meta(name, owner_id, description="", require_approval=False, admin_preset="admins", info_visibility="everyone"):
+    perms = {
+        "send_messages": "everyone",
+        "send_media": "everyone",
+        "add_members": "admins" if admin_preset == "admins" else "everyone",
+        "change_group_info": "admins" if admin_preset == "admins" else "everyone",
+        "pin_messages": "admins" if admin_preset == "admins" else "everyone",
+    }
     return {
         "name": name,
         "description": description,
@@ -84,13 +91,10 @@ def _default_group_meta(name, owner_id, description=""):
         "admin_ids": [owner_id],
         "invite_code": _generate_invite_code(),
         "invite_enabled": True,
-        "permissions": {
-            "send_messages": "everyone",
-            "send_media": "everyone",
-            "add_members": "admins",
-            "change_group_info": "admins",
-            "pin_messages": "admins",
-        },
+        "require_approval": require_approval,
+        "info_visibility": info_visibility,
+        "pending_approvals": [],
+        "permissions": perms,
         "created_at": timezone.now().isoformat(),
     }
 
@@ -142,6 +146,10 @@ def _group_response(conversation, meta, request):
     if invite_code and request:
         invite_link = request.build_absolute_uri(f"/invite/{invite_code}")
 
+    pending_approvals = meta.get("pending_approvals") or []
+    current_uid = request.user.id if (request and hasattr(request, "user") and request.user.is_authenticated) else None
+    is_admin = _is_admin(current_uid, meta) if current_uid else False
+
     return {
         "group_id": str(conversation.id),
         "name": meta.get("name", ""),
@@ -153,6 +161,9 @@ def _group_response(conversation, meta, request):
         "members": members,
         "invite_link": invite_link,
         "invite_code": invite_code,
+        "require_approval": meta.get("require_approval", False),
+        "info_visibility": meta.get("info_visibility", "everyone"),
+        "pending_approvals_count": len(pending_approvals) if is_admin else 0,
         "permissions": meta.get("permissions", {}),
         "disappearing_duration": conversation.disappearing_duration,
         "created_at": conversation.created_at,
@@ -184,24 +195,69 @@ class CreateGroupView(APIView):
         if not isinstance(member_ids, list):
             return Response({"detail": "member_ids must be a list."}, status=status.HTTP_400_BAD_REQUEST)
 
+        from accounts.user_preferences import (
+            get_section_preferences,
+            can_user_add_to_group,
+            create_group_invitation,
+        )
+
         valid_members = list(User.objects.filter(id__in=member_ids, is_active=True))
-        all_ids = list({u.id for u in valid_members} | {request.user.id})
-        if len(all_ids) > 256:
+        all_candidate_ids = list({u.id for u in valid_members} | {request.user.id})
+        if len(all_candidate_ids) > 256:
             return Response({"detail": "Group cannot exceed 256 members."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check who allows being added to groups
+        allowed_ids = {request.user.id}
+        invited_users = []
+        restrictions = []
+
+        for u in valid_members:
+            if u.id == request.user.id:
+                continue
+            allowed, reason = can_user_add_to_group(request.user, u)
+            if allowed:
+                allowed_ids.add(u.id)
+            else:
+                invited_users.append(u)
+                restrictions.append({
+                    "user_id": u.id,
+                    "username": u.username,
+                    "reason": reason,
+                })
 
         with transaction.atomic():
             conversation = Conversation.objects.create(type="group")
-            for uid in all_ids:
+            for uid in allowed_ids:
                 ConversationParticipant.objects.create(
                     conversation=conversation,
                     user_id=uid,
                 )
 
-        meta = _default_group_meta(name, request.user.id, description)
+        owner_g_prefs = get_section_preferences(request.user.id, "group_settings") or {}
+        default_approval = bool(owner_g_prefs.get("member_approval_by_default", False))
+        admin_preset = owner_g_prefs.get("admin_controls_preset", "admins")
+
+        meta = _default_group_meta(
+            name,
+            request.user.id,
+            description,
+            require_approval=default_approval,
+            admin_preset=admin_preset,
+        )
         _save_group_meta(conversation.id, meta)
 
+        # Send invitations to users who cannot be added directly
+        for u in invited_users:
+            create_group_invitation(conversation.id, request.user, u)
+
+        resp_data = _group_response(conversation, meta, request)
+        if invited_users:
+            resp_data["invited_members"] = [u.id for u in invited_users]
+            resp_data["restrictions"] = restrictions
+            resp_data["note"] = f"{len(allowed_ids)-1} member(s) added directly, {len(invited_users)} invitation(s) sent due to privacy preferences."
+
         return Response(
-            _group_response(conversation, meta, request),
+            resp_data,
             status=status.HTTP_201_CREATED,
         )
 
@@ -325,11 +381,28 @@ class GroupMembersView(APIView):
             return Response({"detail": "Group cannot exceed 256 members."}, status=status.HTTP_400_BAD_REQUEST)
 
         added = []
+        invited = []
+        restrictions = []
+
+        from accounts.user_preferences import can_user_add_to_group, create_group_invitation
+
         for uid in member_ids:
             try:
-                User.objects.get(id=uid, is_active=True)
+                target_user = User.objects.get(id=uid, is_active=True)
             except User.DoesNotExist:
                 continue
+
+            allowed, reason = can_user_add_to_group(request.user, target_user)
+            if not allowed:
+                create_group_invitation(group_id, request.user, target_user)
+                invited.append(uid)
+                restrictions.append({
+                    "user_id": uid,
+                    "username": target_user.username,
+                    "reason": reason,
+                })
+                continue
+
             p, created = ConversationParticipant.objects.get_or_create(
                 conversation=conversation,
                 user_id=uid,
@@ -342,7 +415,19 @@ class GroupMembersView(APIView):
             elif created:
                 added.append(uid)
 
-        return Response({"detail": f"{len(added)} member(s) added.", "added_user_ids": added})
+        msg_parts = []
+        if added:
+            msg_parts.append(f"{len(added)} member(s) added")
+        if invited:
+            msg_parts.append(f"{len(invited)} invitation(s) sent")
+        detail_msg = ", ".join(msg_parts) + "." if msg_parts else "No members added."
+
+        return Response({
+            "detail": detail_msg,
+            "added_user_ids": added,
+            "invited_user_ids": invited,
+            "restrictions": restrictions,
+        })
 
 
 class GroupMemberRemoveView(APIView):
@@ -552,6 +637,38 @@ class JoinViaInviteView(APIView):
         if current_count >= 256:
             return Response({"detail": "Group is full (max 256 members)."}, status=status.HTTP_400_BAD_REQUEST)
 
+        # If member approval is required, check if already active or place into pending_approvals
+        if matched_meta.get("require_approval", False):
+            existing_p = ConversationParticipant.objects.filter(
+                conversation=matched_conv, user=request.user, deleted_at__isnull=True
+            ).first()
+            if existing_p:
+                return Response(_group_response(matched_conv, matched_meta, request), status=status.HTTP_200_OK)
+
+            pending = matched_meta.setdefault("pending_approvals", [])
+            if any(item.get("user_id") == request.user.id for item in pending):
+                return Response({
+                    "status": "pending_approval",
+                    "group_id": str(matched_conv.id),
+                    "name": matched_meta.get("name"),
+                    "detail": "You already have a pending join request awaiting admin approval.",
+                }, status=status.HTTP_200_OK)
+
+            pending.append({
+                "user_id": request.user.id,
+                "username": request.user.username,
+                "display_name": getattr(request.user, "display_name", None) or getattr(request.user, "full_name", None) or request.user.username,
+                "exi_id": getattr(request.user, "exi_id", ""),
+                "requested_at": timezone.now().isoformat(),
+            })
+            _save_group_meta(matched_conv.id, matched_meta)
+            return Response({
+                "status": "pending_approval",
+                "group_id": str(matched_conv.id),
+                "name": matched_meta.get("name"),
+                "detail": "Membership approval is enabled for this group. Your join request has been submitted to group admins.",
+            }, status=status.HTTP_202_ACCEPTED)
+
         p, created = ConversationParticipant.objects.get_or_create(
             conversation=matched_conv,
             user=request.user,
@@ -573,11 +690,69 @@ class JoinViaInviteView(APIView):
 
 class GroupAdminControlsView(APIView):
     """
-    POST /api/groups/<group_id>/admins/
-    Promote or demote group admins.
-    Body: { action: "promote"|"demote", user_id: int }
+    Admin controls and role management for a group:
+    - GET   /api/groups/<group_id>/admins/ or /api/groups/<group_id>/admin-controls/
+    - POST  /api/groups/<group_id>/admins/  { action: "promote"|"demote"|"transfer_ownership", user_id }
+    - PATCH /api/groups/<group_id>/admin-controls/  { permissions, require_approval, info_visibility }
     """
     permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, group_id):
+        participant = _get_participant(request.user, group_id)
+        if not participant:
+            return Response({"detail": "Group not found."}, status=status.HTTP_404_NOT_FOUND)
+        conversation = participant.conversation
+        if conversation.type != "group":
+            return Response({"detail": "Not a group."}, status=status.HTTP_400_BAD_REQUEST)
+
+        meta = _get_group_meta(group_id) or {}
+        return Response({
+            "group_id": str(group_id),
+            "owner_id": meta.get("owner_id"),
+            "admin_ids": meta.get("admin_ids") or [],
+            "permissions": meta.get("permissions", {}),
+            "require_approval": meta.get("require_approval", False),
+            "info_visibility": meta.get("info_visibility", "everyone"),
+            "is_admin": _is_admin(request.user.id, meta),
+            "is_owner": request.user.id == meta.get("owner_id"),
+        })
+
+    def patch(self, request, group_id):
+        participant = _get_participant(request.user, group_id)
+        if not participant:
+            return Response({"detail": "Group not found."}, status=status.HTTP_404_NOT_FOUND)
+        conversation = participant.conversation
+        if conversation.type != "group":
+            return Response({"detail": "Not a group."}, status=status.HTTP_400_BAD_REQUEST)
+
+        meta = _get_group_meta(group_id) or {}
+        if not _is_admin(request.user.id, meta):
+            return Response({"detail": "Only admins can update admin controls."}, status=status.HTTP_403_FORBIDDEN)
+
+        data = request.data
+        if "require_approval" in data:
+            meta["require_approval"] = bool(data["require_approval"])
+
+        if "info_visibility" in data:
+            vis = str(data["info_visibility"]).lower().strip()
+            if vis in ("everyone", "members_only", "hidden"):
+                meta["info_visibility"] = vis
+
+        if "permissions" in data and isinstance(data["permissions"], dict):
+            perms = meta.setdefault("permissions", {})
+            for k, v in data["permissions"].items():
+                if k in ("send_messages", "send_media", "add_members", "change_group_info", "pin_messages"):
+                    if str(v).lower() in ("everyone", "admins", "nobody"):
+                        perms[k] = str(v).lower()
+
+        _save_group_meta(group_id, meta)
+        return Response({
+            "group_id": str(group_id),
+            "detail": "Admin controls updated.",
+            "permissions": meta.get("permissions", {}),
+            "require_approval": meta.get("require_approval", False),
+            "info_visibility": meta.get("info_visibility", "everyone"),
+        })
 
     def post(self, request, group_id):
         participant = _get_participant(request.user, group_id)
@@ -594,10 +769,15 @@ class GroupAdminControlsView(APIView):
         action = request.data.get("action")
         target_user_id = request.data.get("user_id")
 
-        if action not in ("promote", "demote"):
-            return Response({"detail": "action must be 'promote' or 'demote'."}, status=status.HTTP_400_BAD_REQUEST)
+        if action not in ("promote", "demote", "transfer_ownership"):
+            return Response({"detail": "action must be 'promote', 'demote', or 'transfer_ownership'."}, status=status.HTTP_400_BAD_REQUEST)
         if not target_user_id:
             return Response({"detail": "user_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            target_user_id = int(target_user_id)
+        except (ValueError, TypeError):
+            return Response({"detail": "Invalid user_id."}, status=status.HTTP_400_BAD_REQUEST)
 
         if not ConversationParticipant.objects.filter(
             conversation=conversation, user_id=target_user_id, deleted_at__isnull=True
@@ -605,19 +785,253 @@ class GroupAdminControlsView(APIView):
             return Response({"detail": "User is not a member of this group."}, status=status.HTTP_404_NOT_FOUND)
 
         admin_ids = list(meta.get("admin_ids") or [])
+
         if action == "promote":
             if target_user_id not in admin_ids:
                 admin_ids.append(target_user_id)
             detail = "User promoted to admin."
-        else:
+        elif action == "demote":
             if meta.get("owner_id") == target_user_id:
                 return Response({"detail": "Cannot demote the group owner."}, status=status.HTTP_400_BAD_REQUEST)
             admin_ids = [uid for uid in admin_ids if uid != target_user_id]
             detail = "User demoted from admin."
+        elif action == "transfer_ownership":
+            if request.user.id != meta.get("owner_id"):
+                return Response({"detail": "Only the group owner can transfer ownership."}, status=status.HTTP_403_FORBIDDEN)
+            meta["owner_id"] = target_user_id
+            if target_user_id not in admin_ids:
+                admin_ids.append(target_user_id)
+            if request.user.id not in admin_ids:
+                admin_ids.append(request.user.id)
+            detail = f"Ownership transferred to user {target_user_id}."
 
         meta["admin_ids"] = admin_ids
         _save_group_meta(group_id, meta)
-        return Response({"detail": detail, "admin_ids": admin_ids})
+        return Response({
+            "detail": detail,
+            "owner_id": meta.get("owner_id"),
+            "admin_ids": admin_ids,
+        })
+
+
+class GroupApprovalsView(APIView):
+    """
+    Manage member join requests for groups with Member Approval enabled:
+    - GET  /api/groups/<group_id>/approvals/ - List pending requests
+    - POST /api/groups/<group_id>/approvals/<user_id>/approve/ - Approve user
+    - POST /api/groups/<group_id>/approvals/<user_id>/reject/ - Reject user
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, group_id):
+        participant = _get_participant(request.user, group_id)
+        if not participant:
+            return Response({"detail": "Group not found."}, status=status.HTTP_404_NOT_FOUND)
+        conversation = participant.conversation
+        if conversation.type != "group":
+            return Response({"detail": "Not a group."}, status=status.HTTP_400_BAD_REQUEST)
+
+        meta = _get_group_meta(group_id) or {}
+        if not _is_admin(request.user.id, meta):
+            return Response({"detail": "Only admins can view pending approvals."}, status=status.HTTP_403_FORBIDDEN)
+
+        pending = meta.get("pending_approvals") or []
+        return Response({
+            "group_id": str(group_id),
+            "require_approval": meta.get("require_approval", False),
+            "pending_count": len(pending),
+            "pending_approvals": pending,
+        })
+
+    def post(self, request, group_id, user_id=None, action=None):
+        participant = _get_participant(request.user, group_id)
+        if not participant:
+            return Response({"detail": "Group not found."}, status=status.HTTP_404_NOT_FOUND)
+        conversation = participant.conversation
+        if conversation.type != "group":
+            return Response({"detail": "Not a group."}, status=status.HTTP_400_BAD_REQUEST)
+
+        meta = _get_group_meta(group_id) or {}
+        if not _is_admin(request.user.id, meta):
+            return Response({"detail": "Only admins can approve or reject join requests."}, status=status.HTTP_403_FORBIDDEN)
+
+        if not user_id:
+            user_id = request.data.get("user_id")
+        if not action:
+            action = request.data.get("action", "approve")
+
+        if not user_id:
+            return Response({"detail": "user_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            target_user = User.objects.get(id=int(user_id), is_active=True)
+        except (User.DoesNotExist, ValueError):
+            return Response({"detail": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        pending = meta.get("pending_approvals") or []
+        target_uid = int(user_id)
+        action = str(action).lower().strip()
+
+        if action == "approve":
+            p, created = ConversationParticipant.objects.get_or_create(
+                conversation=conversation,
+                user=target_user,
+                defaults={"deleted_at": None},
+            )
+            if not created and p.deleted_at is not None:
+                p.deleted_at = None
+                p.save(update_fields=["deleted_at"])
+
+            meta["pending_approvals"] = [item for item in pending if item.get("user_id") != target_uid]
+            _save_group_meta(group_id, meta)
+            return Response({
+                "detail": f"{target_user.username} approved and added to group.",
+                "user_id": target_uid,
+                "action": "approved",
+                "remaining_pending_count": len(meta["pending_approvals"]),
+            })
+        elif action == "reject":
+            meta["pending_approvals"] = [item for item in pending if item.get("user_id") != target_uid]
+            _save_group_meta(group_id, meta)
+            return Response({
+                "detail": f"Join request for {target_user.username} rejected.",
+                "user_id": target_uid,
+                "action": "rejected",
+                "remaining_pending_count": len(meta["pending_approvals"]),
+            })
+        else:
+            return Response({"detail": "action must be 'approve' or 'reject'."}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class GroupVisibilityView(APIView):
+    """
+    GET  /api/groups/<group_id>/visibility/ - Get group visibility
+    PATCH /api/groups/<group_id>/visibility/ - Update group visibility (admins only)
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, group_id):
+        participant = _get_participant(request.user, group_id)
+        if not participant:
+            return Response({"detail": "Group not found."}, status=status.HTTP_404_NOT_FOUND)
+        meta = _get_group_meta(group_id) or {}
+        vis = meta.get("info_visibility", "everyone")
+        return Response({
+            "group_id": str(group_id),
+            "info_visibility": vis,
+            "options": ["everyone", "members_only", "hidden"],
+            "labels": {
+                "everyone": "Everyone",
+                "members_only": "Members Only",
+                "hidden": "Hidden from Search",
+            }
+        })
+
+    def patch(self, request, group_id):
+        participant = _get_participant(request.user, group_id)
+        if not participant:
+            return Response({"detail": "Group not found."}, status=status.HTTP_404_NOT_FOUND)
+        meta = _get_group_meta(group_id) or {}
+        if not _is_admin(request.user.id, meta):
+            return Response({"detail": "Only admins can change group visibility."}, status=status.HTTP_403_FORBIDDEN)
+
+        vis = request.data.get("info_visibility") or request.data.get("visibility")
+        if vis is not None:
+            vis = str(vis).lower().strip()
+            if vis not in ("everyone", "members_only", "hidden"):
+                return Response({"detail": "info_visibility must be 'everyone', 'members_only', or 'hidden'."}, status=status.HTTP_400_BAD_REQUEST)
+            meta["info_visibility"] = vis
+            _save_group_meta(group_id, meta)
+
+        return Response({
+            "group_id": str(group_id),
+            "info_visibility": meta.get("info_visibility", "everyone"),
+            "detail": "Group visibility updated.",
+        })
+
+    put = patch
+
+
+class UserGroupInvitationsView(APIView):
+    """
+    Manage invitations sent to the authenticated user:
+    - GET  /api/groups/invitations/ - List pending invitations
+    - POST /api/groups/invitations/<invitation_id>/accept/ - Accept invitation
+    - POST /api/groups/invitations/<invitation_id>/decline/ - Decline invitation
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        from accounts.user_preferences import get_user_group_invitations
+        status_filter = request.query_params.get("status", "pending")
+        if status_filter == "all":
+            status_filter = None
+        invs = get_user_group_invitations(request.user.id, status_filter=status_filter)
+        return Response({
+            "count": len(invs),
+            "invitations": invs,
+        })
+
+    def post(self, request, invitation_id=None, action=None):
+        from accounts.user_preferences import accept_group_invitation, decline_group_invitation
+
+        if not invitation_id:
+            invitation_id = request.data.get("invitation_id")
+        if not action:
+            action = request.data.get("action", "accept")
+
+        if not invitation_id:
+            return Response({"detail": "invitation_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        action = str(action).lower().strip()
+        if action == "accept":
+            success, detail, group_id = accept_group_invitation(request.user, invitation_id)
+            if not success:
+                return Response({"detail": detail}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({
+                "detail": detail,
+                "group_id": group_id,
+                "invitation_id": invitation_id,
+                "status": "accepted",
+            })
+        elif action == "decline":
+            success, detail = decline_group_invitation(request.user, invitation_id)
+            if not success:
+                return Response({"detail": detail}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({
+                "detail": detail,
+                "invitation_id": invitation_id,
+                "status": "declined",
+            })
+        else:
+            return Response({"detail": "action must be 'accept' or 'decline'."}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class RecentGroupsListView(APIView):
+    """
+    GET /api/groups/recent/ - List user's recent groups with metadata and filters
+    Query params:
+    - ?search=<keyword>
+    - ?role=owner|admin|member
+    - ?limit=<int>
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        from accounts.user_preferences import get_user_recent_groups
+        search = request.query_params.get("search")
+        role = request.query_params.get("role")
+        limit_param = request.query_params.get("limit", 20)
+        try:
+            limit = int(limit_param)
+        except (ValueError, TypeError):
+            limit = 20
+
+        groups = get_user_recent_groups(request.user, request=request, search=search, role=role, limit=limit)
+        return Response({
+            "count": len(groups),
+            "groups": groups,
+        })
 
 
 class GroupLeaveView(APIView):
@@ -721,10 +1135,27 @@ class FavoriteChatsView(APIView):
 
 class FavoriteChatToggleView(APIView):
     """
-    POST /api/chats/<chat_id>/favorite/
-    Toggle a chat as favorite.
+    GET  /api/chats/<chat_id>/favorite/ - Get favorite status
+    POST /api/chats/<chat_id>/favorite/ - Toggle a chat as favorite
     """
     permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, chat_id):
+        try:
+            ConversationParticipant.objects.get(
+                user=request.user, conversation_id=chat_id, deleted_at__isnull=True
+            )
+        except ConversationParticipant.DoesNotExist:
+            return Response({"detail": "Conversation not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        from accounts.user_preferences import get_section_preferences
+        prefs = get_section_preferences(request.user.id, "favorites") or {}
+        ids = prefs.get("chat_ids", [])
+        cid = str(chat_id)
+        return Response({
+            "chat_id": cid,
+            "is_favorited": cid in ids,
+        })
 
     def post(self, request, chat_id):
         try:

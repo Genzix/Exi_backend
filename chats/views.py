@@ -1,6 +1,8 @@
+import re
 from django.db import models, transaction
 from django.db.models import F, Sum
 from django.http import FileResponse
+from django.urls import reverse
 from rest_framework import generics, permissions, status
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
@@ -83,8 +85,13 @@ class StartConversationView(APIView):
             participant.deleted_at = None
             participant.save(update_fields=["deleted_at"])
 
+        from .chat_permissions import normalize_permissions, update_chat_permissions
+        norm_perms = normalize_permissions(request.data)
+        if norm_perms:
+            update_chat_permissions(conversation.id, request.user.id, request.data)
+
         return Response(
-            RecentConversationSerializer(participant).data,
+            RecentConversationSerializer(participant, context={"request": request}).data,
             status=status.HTTP_200_OK,
         )
 
@@ -165,6 +172,19 @@ class ChatDetailsView(generics.RetrieveAPIView):
             user=self.request.user, deleted_at__isnull=True
         ).select_related("conversation")
 
+    def patch(self, request, chat_id):
+        participant = self.get_object()
+        from .chat_permissions import normalize_permissions, update_chat_permissions
+        norm_perms = normalize_permissions(request.data)
+        if norm_perms:
+            update_chat_permissions(participant.conversation_id, request.user.id, request.data)
+        return Response(
+            ConversationDetailSerializer(participant, context={"request": request}).data
+        )
+
+    def post(self, request, chat_id):
+        return self.patch(request, chat_id)
+
 
 # 6. /api/chats/{chat_id}/pin/
 class PinChatView(APIView):
@@ -194,6 +214,20 @@ class PinChatView(APIView):
 class ArchiveChatView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
+    def get(self, request, chat_id):
+        try:
+            participant = ConversationParticipant.objects.get(
+                user=request.user, conversation_id=chat_id
+            )
+            return Response({
+                "chat_id": str(chat_id),
+                "is_archived": participant.is_archived,
+            })
+        except ConversationParticipant.DoesNotExist:
+            return Response(
+                {"detail": "Conversation not found."}, status=status.HTTP_404_NOT_FOUND
+            )
+
     def patch(self, request, chat_id):
         try:
             participant = ConversationParticipant.objects.get(
@@ -213,9 +247,26 @@ class ArchiveChatView(APIView):
                 {"detail": "Conversation not found."}, status=status.HTTP_404_NOT_FOUND
             )
 
+    def post(self, request, chat_id):
+        return self.patch(request, chat_id)
+
 
 class MuteChatView(APIView):
     permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, chat_id):
+        try:
+            participant = ConversationParticipant.objects.get(
+                user=request.user, conversation_id=chat_id
+            )
+            return Response({
+                "chat_id": str(chat_id),
+                "is_muted": participant.is_muted,
+            })
+        except ConversationParticipant.DoesNotExist:
+            return Response(
+                {"detail": "Conversation not found."}, status=status.HTTP_404_NOT_FOUND
+            )
 
     def post(self, request, chat_id):
         try:
@@ -266,6 +317,9 @@ class DeleteChatView(APIView):
             return Response(
                 {"detail": "Conversation not found."}, status=status.HTTP_404_NOT_FOUND
             )
+
+    def post(self, request, chat_id):
+        return self.delete(request, chat_id)
 
 
 # 9. /api/chats/{chat_id}/read/
@@ -319,6 +373,20 @@ class MarkChatReadView(APIView):
 class ClearChatView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
+    def get(self, request, chat_id):
+        try:
+            participant = ConversationParticipant.objects.get(
+                user=request.user, conversation_id=chat_id
+            )
+            return Response({
+                "chat_id": str(chat_id),
+                "cleared_at": participant.cleared_at.isoformat() if participant.cleared_at else None,
+            })
+        except ConversationParticipant.DoesNotExist:
+            return Response(
+                {"detail": "Conversation not found."}, status=status.HTTP_404_NOT_FOUND
+            )
+
     def post(self, request, chat_id):
         try:
             participant = ConversationParticipant.objects.get(
@@ -332,29 +400,115 @@ class ClearChatView(APIView):
                 {"detail": "Conversation not found."}, status=status.HTTP_404_NOT_FOUND
             )
 
+    def delete(self, request, chat_id):
+        return self.post(request, chat_id)
+
 
 class SetDisappearingMessagesView(APIView):
     permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, chat_id):
+        try:
+            participant = ConversationParticipant.objects.select_related("conversation").get(
+                user=request.user, conversation_id=chat_id
+            )
+        except ConversationParticipant.DoesNotExist:
+            return Response(
+                {"detail": "Conversation not found."}, status=status.HTTP_404_NOT_FOUND
+            )
+
+        dur = participant.conversation.disappearing_duration
+        return Response({
+            "chat_id": str(chat_id),
+            "disappearing_duration": dur,
+            "is_enabled": bool(dur and dur > 0),
+            "presets": [
+                {"label": "Off", "duration": 0},
+                {"label": "24 Hours", "duration": 86400},
+                {"label": "7 Days", "duration": 604800},
+                {"label": "90 Days", "duration": 7776000},
+            ]
+        })
 
     def post(self, request, chat_id):
         duration = request.data.get('duration')
         if duration is not None:
             try:
                 duration = int(duration)
-            except ValueError:
+                if duration < 0:
+                    return Response({"detail": "Duration cannot be negative."}, status=status.HTTP_400_BAD_REQUEST)
+            except (ValueError, TypeError):
                 return Response({"detail": "Invalid duration."}, status=status.HTTP_400_BAD_REQUEST)
-                
+
         try:
-            participant = ConversationParticipant.objects.get(
+            participant = ConversationParticipant.objects.select_related("conversation").get(
                 user=request.user, conversation_id=chat_id
             )
-            participant.conversation.disappearing_duration = duration if duration else None
-            participant.conversation.save(update_fields=['disappearing_duration'])
-            return Response({"detail": "Disappearing messages updated.", "duration": duration})
         except ConversationParticipant.DoesNotExist:
             return Response(
                 {"detail": "Conversation not found."}, status=status.HTTP_404_NOT_FOUND
             )
+
+        conv = participant.conversation
+
+        # Check group permission if this is a group conversation
+        if conv.type == 'group':
+            from .group_views import _get_group_meta, _is_admin
+            meta = _get_group_meta(chat_id) or {}
+            perms = meta.get("permissions", {})
+            if perms.get("change_group_info", "everyone") == "admins" and not _is_admin(request.user.id, meta):
+                return Response(
+                    {"detail": "Only group admins can change disappearing messages settings."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        new_duration = duration if (duration and duration > 0) else None
+        old_duration = conv.disappearing_duration
+
+        if new_duration != old_duration:
+            conv.disappearing_duration = new_duration
+            conv.save(update_fields=['disappearing_duration'])
+
+            # Real-time WebSocket broadcast to conversation channel
+            from .utils import broadcast_disappearing_timer, broadcast_chat_message
+            broadcast_disappearing_timer(chat_id, new_duration, request.user)
+
+            # Post a system message in the conversation
+            def _format_dur(secs):
+                if not secs:
+                    return "off"
+                if secs == 86400:
+                    return "24 hours"
+                if secs == 604800:
+                    return "7 days"
+                if secs == 7776000:
+                    return "90 days"
+                if secs >= 86400:
+                    return f"{secs // 86400} days"
+                if secs >= 3600:
+                    return f"{secs // 3600} hours"
+                return f"{secs} seconds"
+
+            user_name = getattr(request.user, "display_name", "") or getattr(request.user, "first_name", "") or request.user.username
+            if new_duration:
+                sys_text = f"{user_name} turned on disappearing messages ({_format_dur(new_duration)})."
+            else:
+                sys_text = f"{user_name} turned off disappearing messages."
+
+            sys_msg = Message.objects.create(
+                conversation=conv,
+                sender=request.user,
+                content=sys_text,
+                message_type='text',
+            )
+            broadcast_chat_message(chat_id, sys_msg)
+
+        return Response({
+            "detail": "Disappearing messages updated successfully.",
+            "chat_id": str(chat_id),
+            "disappearing_duration": new_duration,
+            "is_enabled": bool(new_duration),
+        })
 
 
 class ReportUserView(APIView):
@@ -524,14 +678,95 @@ class ChatSettingsView(APIView):
                 from accounts.models import BlockedUser
                 is_blocked = BlockedUser.objects.filter(blocker=request.user, blocked=other_user).exists()
 
+        from .chat_permissions import get_chat_permissions_display, normalize_permissions, update_chat_permissions
+        from .chat_settings_flow import get_chat_settings_flow_data
+
+        flow = get_chat_settings_flow_data(request.user, chat_id)
+
         data = {
+            "chat_id": str(chat_id),
             "is_muted": participant.is_muted,
             "is_pinned": participant.is_pinned,
             "is_archived": participant.is_archived,
             "disappearing_duration": participant.conversation.disappearing_duration,
             "is_blocked": is_blocked,
+            "permissions": get_chat_permissions_display(participant.conversation_id, request.user.id),
+            "navigation": flow.get("sections") if flow else None,
         }
         return Response(data)
+
+    def patch(self, request, chat_id):
+        try:
+            participant = ConversationParticipant.objects.select_related('conversation').get(
+                user=request.user, conversation_id=chat_id
+            )
+        except ConversationParticipant.DoesNotExist:
+            return Response({"detail": "Conversation not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        from .chat_permissions import normalize_permissions, update_chat_permissions
+        norm_perms = normalize_permissions(request.data)
+        if norm_perms:
+            update_chat_permissions(participant.conversation_id, request.user.id, request.data)
+
+        updated_fields = []
+        if "is_muted" in request.data:
+            participant.is_muted = bool(request.data["is_muted"])
+            updated_fields.append("is_muted")
+        if "is_pinned" in request.data:
+            participant.is_pinned = bool(request.data["is_pinned"])
+            updated_fields.append("is_pinned")
+        if "is_archived" in request.data:
+            participant.is_archived = bool(request.data["is_archived"])
+            updated_fields.append("is_archived")
+        if updated_fields:
+            participant.save(update_fields=updated_fields)
+
+        return self.get(request, chat_id)
+
+
+class ChatPermissionsView(APIView):
+    """
+    GET   /api/chats/<chat_id>/permissions/  - View permissions for this chat
+    POST  /api/chats/<chat_id>/permissions/  - Choose/update permissions for this chat
+    PATCH /api/chats/<chat_id>/permissions/  - Choose/update permissions for this chat
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _get_participant(self, user, chat_id):
+        try:
+            return ConversationParticipant.objects.select_related("conversation").get(
+                user=user, conversation_id=chat_id, deleted_at__isnull=True
+            )
+        except ConversationParticipant.DoesNotExist:
+            return None
+
+    def get(self, request, chat_id):
+        participant = self._get_participant(request.user, chat_id)
+        if not participant:
+            return Response({"detail": "Conversation not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        from .chat_permissions import get_chat_permissions_display
+        perms = get_chat_permissions_display(chat_id, request.user.id)
+        return Response({
+            "chat_id": str(chat_id),
+            "permissions": perms,
+        })
+
+    def patch(self, request, chat_id):
+        participant = self._get_participant(request.user, chat_id)
+        if not participant:
+            return Response({"detail": "Conversation not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        from .chat_permissions import update_chat_permissions
+        perms = update_chat_permissions(chat_id, request.user.id, request.data)
+        return Response({
+            "chat_id": str(chat_id),
+            "detail": "Chat permissions updated successfully.",
+            "permissions": perms,
+        })
+
+    def post(self, request, chat_id):
+        return self.patch(request, chat_id)
 
 def guard_message_send(request, conversation):
     """Shared abuse checks for every outbound-message path. Returns a Response on failure."""
@@ -625,6 +860,11 @@ class SendMediaMessageView(APIView):
         blocked_response = guard_message_send(request, participant.conversation)
         if blocked_response:
             return blocked_response
+
+        from .chat_permissions import check_chat_media_permission
+        media_allowed, media_err = check_chat_media_permission(chat_id, request.user.id)
+        if not media_allowed:
+            return Response({"detail": media_err}, status=status.HTTP_403_FORBIDDEN)
 
         serializer = MediaMessageUploadSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -1145,6 +1385,11 @@ class MediaCompleteView(APIView):
             if blocked_response:
                 return blocked_response
 
+            from .chat_permissions import check_chat_media_permission
+            media_allowed, media_err = check_chat_media_permission(chat_id, request.user.id)
+            if not media_allowed:
+                return Response({"detail": media_err}, status=status.HTTP_403_FORBIDDEN)
+
             msg = Message.objects.create(
                 conversation_id=chat_id,
                 sender=request.user,
@@ -1285,12 +1530,22 @@ def search_users_queryset(user, query):
     if not query:
         return User.objects.none()
     hidden_ids = blocked_user_ids(user)
+
+    clean_query = query.strip()
+    digits = re.sub(r"\D", "", clean_query)
+    search_filter = (
+        models.Q(display_name__icontains=clean_query)
+        | models.Q(full_name__icontains=clean_query)
+        | models.Q(exi_id__icontains=clean_query)
+        | models.Q(username__icontains=clean_query)
+    )
+    if len(digits) >= 6:
+        search_filter |= models.Q(phone__icontains=clean_query)
+        if len(digits) >= 10:
+            search_filter |= models.Q(phone__endswith=digits[-10:])
+
     return (
-        User.objects.filter(
-            models.Q(display_name__icontains=query)
-            | models.Q(full_name__icontains=query)
-            | models.Q(exi_id__icontains=query)
-        )
+        User.objects.filter(search_filter)
         .filter(is_active=True)
         # Respect the "discoverable in search" privacy control. Users who have
         # never opened privacy settings have no row yet and stay searchable.
@@ -1320,25 +1575,44 @@ def search_chats_queryset(user, query):
 
 
 def search_messages_queryset(user, query, chat_id=None):
-    participant_conversations = ConversationParticipant.objects.filter(
+    from datetime import timedelta
+    now = timezone.now()
+
+    participants = ConversationParticipant.objects.filter(
         user=user,
         deleted_at__isnull=True,
-    ).values_list("conversation_id", flat=True)
-
-    queryset = Message.objects.filter(
-        conversation_id__in=participant_conversations
-    ).select_related("sender", "conversation").order_by("-created_at")
+    ).select_related("conversation")
 
     if chat_id:
-        queryset = queryset.filter(conversation_id=chat_id)
+        participants = participants.filter(conversation_id=chat_id)
 
-    if not query:
-        return queryset.none()
+    if not participants.exists() or not query:
+        return Message.objects.none()
 
-    return queryset.filter(
-        models.Q(content__icontains=query)
-        | models.Q(attachment_name__icontains=query)
-    )[:MESSAGE_SEARCH_LIMIT]
+    q_filter = models.Q()
+    for p in participants:
+        conv_q = models.Q(conversation_id=p.conversation_id)
+        min_created = p.cleared_at
+        if p.conversation.disappearing_duration:
+            expired_threshold = now - timedelta(seconds=p.conversation.disappearing_duration)
+            if min_created:
+                min_created = max(min_created, expired_threshold)
+            else:
+                min_created = expired_threshold
+
+        if min_created:
+            conv_q &= models.Q(created_at__gte=min_created)
+        q_filter |= conv_q
+
+    return (
+        Message.objects.filter(q_filter)
+        .filter(
+            models.Q(content__icontains=query)
+            | models.Q(attachment_name__icontains=query)
+        )
+        .select_related("sender", "conversation")
+        .order_by("-created_at")[:MESSAGE_SEARCH_LIMIT]
+    )
 
 
 class SearchUsersAPIView(APIView):

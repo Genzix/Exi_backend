@@ -57,6 +57,26 @@ def broadcast_typing_status(conversation_id, user_id, is_typing):
     )
 
 
+def broadcast_disappearing_timer(conversation_id, duration, user):
+    """Broadcast disappearing messages timer change to all conversation participants."""
+    channel_layer = get_channel_layer()
+    if channel_layer is None:
+        return
+    async_to_sync(channel_layer.group_send)(
+        f"chat_{conversation_id}",
+        {
+            "type": "disappearing_timer_updated",
+            "chat_id": str(conversation_id),
+            "duration": duration,
+            "updated_by": {
+                "id": user.id,
+                "username": user.username,
+                "display_name": getattr(user, "display_name", "") or getattr(user, "first_name", "") or user.username,
+            },
+        },
+    )
+
+
 TYPING_TTL_SECONDS = 5
 
 
@@ -128,8 +148,13 @@ def other_direct_participant(conversation, user):
 
 
 def check_send_permission(user, conversation):
-    """Enforce blocks and the recipient's message privacy. Returns (ok, detail)."""
+    """Enforce blocks, chat permissions, and the recipient's message privacy. Returns (ok, detail)."""
     from accounts.utils import can_message
+    from .chat_permissions import check_chat_message_permission
+
+    allowed, detail = check_chat_message_permission(conversation.id, user.id)
+    if not allowed:
+        return False, detail
 
     other = other_direct_participant(conversation, user)
     if other is None:
@@ -453,4 +478,42 @@ def notify_missed_call(call):
             'conversation_id': str(call.conversation_id),
         },
     )
+
+
+def purge_expired_disappearing_messages(dry_run=False):
+    """
+    Finds and purges messages that have exceeded their conversation's disappearing duration.
+    Also deletes any attached files to reclaim storage.
+    Returns: dict with counts of scanned conversations, expired messages, and deleted messages.
+    """
+    from datetime import timedelta
+    from django.utils import timezone
+    from .models import Conversation, Message
+
+    now = timezone.now()
+    total_messages_purged = 0
+    conversations = Conversation.objects.filter(disappearing_duration__gt=0)
+
+    for conv in conversations:
+        cutoff = now - timedelta(seconds=conv.disappearing_duration)
+        expired = Message.objects.filter(conversation=conv, created_at__lt=cutoff)
+        count = expired.count()
+        if count > 0:
+            if not dry_run:
+                for msg in expired:
+                    if msg.attachment:
+                        try:
+                            msg.attachment.delete(save=False)
+                        except Exception:
+                            pass
+                deleted_count, _ = expired.delete()
+                total_messages_purged += deleted_count
+            else:
+                total_messages_purged += count
+
+    return {
+        "conversations_checked": conversations.count(),
+        "messages_purged": total_messages_purged,
+        "dry_run": dry_run,
+    }
 

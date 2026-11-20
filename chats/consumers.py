@@ -97,6 +97,38 @@ class ChatConsumer(AsyncWebsocketConsumer):
                     "message": message_data,
                 },
             )
+        elif action in ("set_permissions", "update_permissions"):
+            from .chat_permissions import update_chat_permissions
+            perms = await sync_to_async(update_chat_permissions)(
+                self.conversation_id, self.scope["user"].id, data
+            )
+            await self.send(
+                text_data=json.dumps({
+                    "type": "chat_permissions_updated",
+                    "chat_id": str(self.conversation_id),
+                    "permissions": perms,
+                })
+            )
+            await self.channel_layer.group_send(
+                self.room_group_name,
+                {
+                    "type": "chat_permissions_broadcast",
+                    "user_id": self.scope["user"].id,
+                    "permissions": perms,
+                },
+            )
+        elif action in ("get_permissions",):
+            from .chat_permissions import get_chat_permissions_display
+            perms = await sync_to_async(get_chat_permissions_display)(
+                self.conversation_id, self.scope["user"].id
+            )
+            await self.send(
+                text_data=json.dumps({
+                    "type": "chat_permissions",
+                    "chat_id": str(self.conversation_id),
+                    "permissions": perms,
+                })
+            )
         elif action == "mark_delivered":
             message_id = data.get("message_id")
             if message_id:
@@ -177,6 +209,19 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 )
             )
 
+    async def chat_permissions_broadcast(self, event):
+        await self.send(
+            text_data=json.dumps(
+                {
+                    "type": "chat_permissions_updated",
+                    "chat_id": str(self.conversation_id),
+                    "user_id": event.get("user_id"),
+                    "permissions": event.get("permissions"),
+                },
+                cls=DjangoJSONEncoder,
+            )
+        )
+
     async def reaction_update(self, event):
         await self.send(
             text_data=json.dumps(
@@ -186,6 +231,19 @@ class ChatConsumer(AsyncWebsocketConsumer):
                     "user_id": event["user_id"],
                     "reaction": event["reaction"],
                     "action": event["action"],
+                },
+                cls=DjangoJSONEncoder,
+            )
+        )
+
+    async def disappearing_timer_updated(self, event):
+        await self.send(
+            text_data=json.dumps(
+                {
+                    "type": "disappearing_timer_updated",
+                    "chat_id": event["chat_id"],
+                    "duration": event["duration"],
+                    "updated_by": event["updated_by"],
                 },
                 cls=DjangoJSONEncoder,
             )

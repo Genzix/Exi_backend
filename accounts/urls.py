@@ -1,7 +1,9 @@
 from django.urls import path
 from rest_framework_simplejwt.views import TokenRefreshView
+# pyrefly: ignore[missing-import]
 
 from .views import (
+    # Auth & Profile
     ForgotPasswordView,
     LoginView,
     LogoutView,
@@ -41,8 +43,7 @@ from .views import (
     AdminModerationOverviewView,
     AdminActivityLogListView,
     AdminAnalyticsView,
-)
-from .settings_views import (
+    # Settings
     UnifiedSettingsView,
     NotificationSettingsView,
     NotificationMuteView,
@@ -56,6 +57,10 @@ from .settings_views import (
     ChatUnarchiveAllView,
     AppearanceSettingsView,
     StorageSettingsView,
+    StorageDataFlowView,
+    StorageCacheView,
+    StorageWifiAutoDownloadView,
+    StorageCellularAutoDownloadView,
     StorageUsageView,
     StorageChatsView,
     ManageStorageView,
@@ -65,37 +70,91 @@ from .settings_views import (
     StorageLargeFilesDeleteView,
     StorageClearMediaView,
     StorageClearMediaPreviewView,
-)
-from .extra_views import (
-    # Security
+    # Security & Extra
+    SecurityFlowView,
+    AppSecurityView,
+    ChangePasscodeView,
+    EncryptionInfoView,
+    SecurityDevicesManageView,
+    SecurityAlertsView,
     AppLockSettingsView,
     AppLockPinSetView,
     AppLockPinVerifyView,
     TwoStepVerificationView,
     SecurityNotificationsView,
     UnknownCallerProtectionView,
-    # Call settings
     CallNotificationsView,
-    # Discovery
+    CallSettingsView,
+    VideoCallSettingsView,
+    CallManagementView,
+    # Group Settings Flow
+    GroupSettingsFlowView,
+    WhoCanAddMeToGroupsView,
+    GroupPrivacyView,
+    GroupInvitationsPreferenceView,
+    GroupMemberApprovalPreferenceView,
+    GroupAdminControlsPreferenceView,
+    GroupInfoVisibilityView,
+    RecentGroupsView,
     NearbyPlacesView,
     NearbyBusinessesView,
     DiscoveryEventsView,
     DiscoveryOffersView,
     AIRecommendationsView,
-    # Business
     BusinessProfileView,
     BusinessSetupView,
     BusinessProductsView,
     BusinessProductDetailView,
     BusinessOffersView,
     BusinessCustomerChatView,
-    # Help
     HelpCenterView,
     HelpArticleView,
     ReportProblemView,
     ContactSupportView,
     TermsView,
     PrivacyPolicyView,
+    # Contacts & Discovery
+    ContactsView,
+    ContactDetailView,
+    FindOnExiView,
+    UserQRCodeView,
+    # Live Notes
+    UserLiveNoteView,
+    LiveNotePresetsView,
+    LiveNotesFeedView,
+    # Status (Stories) Workflow
+    StatusCreateView,
+    StatusDetailView,
+    StatusViewRecordView,
+    StatusViewersListView,
+    UserStatusListView,
+    StatusMuteView,
+    StatusPrivacySettingsView,
+    # 1. Profile & EXI Card
+    EXICardView,
+    PublicEXICardView,
+    EditProfileView,
+    # 2. Share profile Health Card
+    HealthCardView,
+    HealthEmergencyContactView,
+    HealthFamilyProfilesView,
+    HealthFamilyProfileDetailView,
+    PublicHealthCardShareView,
+    # 3. My Vault
+    VaultOverviewView,
+    VaultPinSetView,
+    VaultUnlockView,
+    VaultDocumentsView,
+    VaultDocumentDetailView,
+    VaultDocumentShareView,
+    VaultHistoryView,
+)
+from .privacy_flow import (
+    PrivacyFlowView,
+    PrivacyFindingYouView,
+    PrivacyActivityView,
+    PrivacyProfileView,
+    PrivacyRestrictedUsersView,
 )
 
 urlpatterns = [
@@ -119,6 +178,11 @@ urlpatterns = [
     # Profile
     path("profile/me/", MyProfileView.as_view()),
     path("profile/status/", OnlineStatusView.as_view()),
+    path("profile/note/", UserLiveNoteView.as_view()),
+    path("profile/note/presets/", LiveNotePresetsView.as_view()),
+    path("users/notes/", LiveNotesFeedView.as_view()),
+    path("users/notes/me/", UserLiveNoteView.as_view()),
+    path("contacts/notes/", LiveNotesFeedView.as_view()),
     path("profile/<str:exi_id>/", ProfileByExiIdView.as_view()),
 
     # Account Section (Profile, Username, Phone Number, Linked Devices)
@@ -147,6 +211,26 @@ urlpatterns = [
     path("security/privacy/", PrivacySettingsView.as_view()),
     path("privacy/", PrivacySettingsView.as_view()),
     path("account/privacy/", PrivacySettingsView.as_view()),
+    path("privacy/flow/", PrivacyFlowView.as_view()),
+    path("privacy/navigation/", PrivacyFlowView.as_view()),
+    path("privacy/finding-you/", PrivacyFindingYouView.as_view()),
+    path("privacy/activity/", PrivacyActivityView.as_view()),
+    path("privacy/profile/", PrivacyProfileView.as_view()),
+    path("privacy/restricted/", PrivacyRestrictedUsersView.as_view()),
+    path("privacy/restrict/", PrivacyRestrictedUsersView.as_view()),
+    path("privacy/restrict/<int:user_id>/", PrivacyRestrictedUsersView.as_view()),
+    path("privacy/unrestrict/", PrivacyRestrictedUsersView.as_view()),
+    path("privacy/unrestrict/<int:user_id>/", PrivacyRestrictedUsersView.as_view()),
+
+    # Security Settings Master Flow (App Security, 2FA, Encryption, Active Sessions, Alerts)
+    path("security/flow/", SecurityFlowView.as_view()),
+    path("security/app-security/", AppSecurityView.as_view()),
+    path("security/passcode/change/", ChangePasscodeView.as_view()),
+    path("security/passcode/verify/", ChangePasscodeView.as_view()),
+    path("security/encryption/", EncryptionInfoView.as_view()),
+    path("security/devices/", SecurityDevicesManageView.as_view()),
+    path("security/devices/logout-others/", SecurityDevicesManageView.as_view()),
+    path("security/alerts/", SecurityAlertsView.as_view()),
 
     # Security — App Lock
     path("security/app-lock/", AppLockSettingsView.as_view()),
@@ -214,7 +298,15 @@ urlpatterns = [
 
     # Storage Settings & Management (10.1 - 10.5)
     path("settings/storage/", StorageSettingsView.as_view()),
+    path("settings/storage/flow/", StorageDataFlowView.as_view()),
     path("settings/storage/auto-download/", StorageSettingsView.as_view()),
+    path("settings/storage/cache/", StorageCacheView.as_view()),
+    path("settings/storage/clear-cache/", StorageCacheView.as_view()),
+    path("settings/storage/cache/clear/", StorageCacheView.as_view()),
+    path("settings/storage/wifi/", StorageWifiAutoDownloadView.as_view()),
+    path("settings/storage/auto-download/wifi/", StorageWifiAutoDownloadView.as_view()),
+    path("settings/storage/cellular/", StorageCellularAutoDownloadView.as_view()),
+    path("settings/storage/auto-download/cellular/", StorageCellularAutoDownloadView.as_view()),
     path("settings/storage/usage/", StorageUsageView.as_view()),
     path("settings/storage/chats/", StorageChatsView.as_view()),
     path("settings/storage/manage/", ManageStorageView.as_view()),
@@ -225,8 +317,23 @@ urlpatterns = [
     path("settings/storage/clear-media/", StorageClearMediaView.as_view()),
     path("settings/storage/clear-media/preview/", StorageClearMediaPreviewView.as_view()),
 
-    # Call Settings (Notifications & Low Data Mode)
-    path("settings/calls/", CallNotificationsView.as_view()),
+    # Call Settings (Who Can Call Me, Video Call Settings, Call Management)
+    path("settings/calls/", CallSettingsView.as_view()),
+    path("settings/calls/video/", VideoCallSettingsView.as_view()),
+    path("settings/calls/management/", CallManagementView.as_view()),
+
+    # Group Settings Flow (Who can add me to groups, Group Privacy: Invitations, Approval, Admin Controls, Visibility, Recent Groups)
+    path("settings/groups/", GroupSettingsFlowView.as_view()),
+    path("settings/groups/flow/", GroupSettingsFlowView.as_view()),
+    path("settings/groups/who-can-add/", WhoCanAddMeToGroupsView.as_view()),
+    path("privacy/groups/who-can-add/", WhoCanAddMeToGroupsView.as_view()),
+    path("privacy/groups/", WhoCanAddMeToGroupsView.as_view()),
+    path("settings/groups/privacy/", GroupPrivacyView.as_view()),
+    path("settings/groups/invitations/", GroupInvitationsPreferenceView.as_view()),
+    path("settings/groups/member-approval/", GroupMemberApprovalPreferenceView.as_view()),
+    path("settings/groups/admin-controls/", GroupAdminControlsPreferenceView.as_view()),
+    path("settings/groups/visibility/", GroupInfoVisibilityView.as_view()),
+    path("settings/groups/recent/", RecentGroupsView.as_view()),
 
     # Discovery
     path("discovery/nearby/", NearbyPlacesView.as_view()),
@@ -250,4 +357,49 @@ urlpatterns = [
     path("help/contact/", ContactSupportView.as_view()),
     path("help/terms/", TermsView.as_view()),
     path("help/privacy/", PrivacyPolicyView.as_view()),
+
+    # Contacts & User Discovery (Screens: New Contact, All Contacts, Find on EXI)
+    path("contacts/", ContactsView.as_view()),
+    path("contacts/<str:contact_id>/", ContactDetailView.as_view()),
+    path("users/find/", FindOnExiView.as_view()),
+    path("users/qr/", UserQRCodeView.as_view()),
+    path("users/qr/scan/", UserQRCodeView.as_view()),
+
+    # Status (Stories) Workflow (Add Status, Photo/Video/Text, Captions, Visibility, Viewers, 24h Expiry)
+    path("status/", StatusCreateView.as_view()),
+    path("status/feed/", StatusCreateView.as_view()),
+    path("status/create/", StatusCreateView.as_view()),
+    path("status/settings/", StatusPrivacySettingsView.as_view()),
+    path("status/<str:status_id>/", StatusDetailView.as_view()),
+    path("status/<str:status_id>/view/", StatusViewRecordView.as_view()),
+    path("status/<str:status_id>/viewers/", StatusViewersListView.as_view()),
+    path("status/user/<int:user_id>/", UserStatusListView.as_view()),
+    path("status/mute/<int:user_id>/", StatusMuteView.as_view(), kwargs={"action": "mute"}),
+    path("status/unmute/<int:user_id>/", StatusMuteView.as_view(), kwargs={"action": "unmute"}),
+
+    # 1. Profile & Digital EXI Card
+    path("profile/card/", EXICardView.as_view()),
+    path("profile/exi-card/", EXICardView.as_view()),
+    path("profile/card/<str:exi_id>/", PublicEXICardView.as_view()),
+    path("profile/edit/", EditProfileView.as_view()),
+
+    # 2. Share profile Health Card & Emergency Information
+    path("health/card/", HealthCardView.as_view()),
+    path("health/card/emergency-contacts/", HealthEmergencyContactView.as_view()),
+    path("health/card/emergency-contacts/<str:contact_id>/", HealthEmergencyContactView.as_view()),
+    path("health/family/", HealthFamilyProfilesView.as_view()),
+    path("health/family/<str:family_id>/", HealthFamilyProfileDetailView.as_view()),
+    path("health/card/share/<str:token>/", PublicHealthCardShareView.as_view()),
+
+    # 3. My Vault (Private Document Storage, Categories, PIN/Biometrics, Sharing, Access History)
+    path("vault/", VaultOverviewView.as_view()),
+    path("vault/overview/", VaultOverviewView.as_view()),
+    path("vault/pin/set/", VaultPinSetView.as_view()),
+    path("vault/unlock/", VaultUnlockView.as_view(), kwargs={"action": "unlock"}),
+    path("vault/lock/", VaultUnlockView.as_view(), kwargs={"action": "lock"}),
+    path("vault/documents/", VaultDocumentsView.as_view()),
+    path("vault/documents/<str:doc_id>/", VaultDocumentDetailView.as_view()),
+    path("vault/documents/<str:doc_id>/share/", VaultDocumentShareView.as_view()),
+    path("vault/shared-with-me/", VaultDocumentShareView.as_view()),
+    path("vault/history/", VaultHistoryView.as_view()),
 ]
