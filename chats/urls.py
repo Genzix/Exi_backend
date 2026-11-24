@@ -21,6 +21,18 @@ from .views import (
     ChatPermissionsView,
     SendMessageView,
     SendMediaMessageView,
+    ChatAttachmentMenuView,
+    ChatAttachmentSendView,
+    ChatContactAttachmentView,
+    ChatLocationAttachmentView,
+    ChatTimeCapsuleAttachmentView,
+    ChatTimeCapsuleDetailView,
+    ChatExiPopAttachmentView,
+    ChatExiPopOpenView,
+    ContactCardDetailView,
+    ContactCardSaveContactView,
+    MessageRetryView,
+    MessageFailView,
     DownloadAttachmentView,
     MessageStatusUpdateView,
     MessageEditDeleteView,
@@ -128,6 +140,29 @@ urlpatterns = [
     path("chats/<uuid:chat_id>/restrict/", ChatRestrictView.as_view()),
     path("chats/<uuid:chat_id>/messages/send/", SendMessageView.as_view()),
     path("chats/<uuid:chat_id>/messages/media/", SendMediaMessageView.as_view()),
+
+    # Attachment Menu & Attachment Workflow Endpoints
+    path("chats/<uuid:chat_id>/attachments/menu/", ChatAttachmentMenuView.as_view()),
+    path("chats/<uuid:chat_id>/attachments/", ChatAttachmentSendView.as_view()),
+    path("chats/<uuid:chat_id>/attachments/send/", ChatAttachmentSendView.as_view()),
+    path("chats/<uuid:chat_id>/attachments/contact/", ChatContactAttachmentView.as_view()),
+    path("chats/<uuid:chat_id>/attachments/location/", ChatLocationAttachmentView.as_view()),
+    path("chats/<uuid:chat_id>/attachments/time-capsule/", ChatTimeCapsuleAttachmentView.as_view()),
+    path("chats/<uuid:chat_id>/attachments/time-capsule/<uuid:message_id>/", ChatTimeCapsuleDetailView.as_view()),
+    path("chats/<uuid:chat_id>/attachments/exi-pop/", ChatExiPopAttachmentView.as_view()),
+    path("chats/<uuid:chat_id>/attachments/exi-pop/<uuid:message_id>/open/", ChatExiPopOpenView.as_view()),
+
+    # Contact Card Modal Details & One-Tap Add Contact (Image 1 & 2)
+    path("chats/messages/<uuid:message_id>/contact-card/", ContactCardDetailView.as_view()),
+    path("chats/<uuid:chat_id>/messages/<uuid:message_id>/contact-card/", ContactCardDetailView.as_view()),
+    path("chats/messages/<uuid:message_id>/save-contact/", ContactCardSaveContactView.as_view()),
+    path("chats/<uuid:chat_id>/messages/<uuid:message_id>/save-contact/", ContactCardSaveContactView.as_view()),
+
+    # Message Retry & Failure Flow ("! Not sent • Tap to retry" in Image 1)
+    path("messages/<uuid:message_id>/retry/", MessageRetryView.as_view()),
+    path("chats/<uuid:chat_id>/messages/<uuid:message_id>/retry/", MessageRetryView.as_view()),
+    path("messages/<uuid:message_id>/fail/", MessageFailView.as_view()),
+    path("chats/<uuid:chat_id>/messages/<uuid:message_id>/fail/", MessageFailView.as_view()),
     path(
         "messages/<uuid:message_id>/attachment/",
         DownloadAttachmentView.as_view(),

@@ -129,17 +129,41 @@ class MessageSerializer(serializers.ModelSerializer):
     is_starred = serializers.SerializerMethodField()
     expires_at = serializers.SerializerMethodField()
     is_disappearing = serializers.SerializerMethodField()
+    attachment_data = serializers.SerializerMethodField()
 
     class Meta:
         model = Message
         fields = [
             'id', 'sender', 'content', 'message_type', 'media_id',
             'attachment_name', 'attachment_mime_type', 'attachment_size',
-            'download_url', 'status', 'created_at',
+            'download_url', 'attachment_data', 'status', 'created_at',
             'is_encrypted', 'ciphertext', 'encryption_version', 'sender_device_id',
             'reactions', 'is_starred', 'forwarded_from', 'scheduled_for', 'is_scheduled',
             'expires_at', 'is_disappearing'
         ]
+
+    def get_attachment_data(self, obj):
+        import json
+        mtype = obj.message_type
+        if mtype in ('contact', 'location', 'capsule', 'exi_pop'):
+            try:
+                data = json.loads(obj.content)
+                if isinstance(data, dict):
+                    if mtype == 'capsule' and obj.scheduled_for:
+                        from django.utils import timezone
+                        now = timezone.now()
+                        request = self.context.get('request')
+                        is_sender = request and request.user.id == obj.sender_id
+                        is_unlocked = now >= obj.scheduled_for
+                        data['is_unlocked'] = is_unlocked
+                        if not is_unlocked and not is_sender:
+                            data['secret_content'] = None
+                            data['content'] = None
+                            data['message'] = None
+                    return data
+            except (ValueError, TypeError):
+                pass
+        return None
 
     def get_download_url(self, obj):
         request = self.context.get('request')
@@ -326,6 +350,112 @@ class MediaMessageUploadSerializer(serializers.Serializer):
                 {'file': f'The uploaded file is not a valid {media_type} file.'}
             )
         return data
+
+
+class ContactAttachmentSerializer(serializers.Serializer):
+    """Attachment: Share contact card data (matching Contact Card & Bottom Sheet)."""
+    name = serializers.CharField(max_length=150, required=True)
+    phone = serializers.CharField(max_length=30, required=False, allow_blank=True, default="")
+    phone_type = serializers.CharField(max_length=50, required=False, allow_blank=True, default="Mobile")
+    country = serializers.CharField(max_length=50, required=False, allow_blank=True, default="India")
+    role = serializers.CharField(max_length=150, required=False, allow_blank=True, default="")
+    exi_id = serializers.CharField(max_length=32, required=False, allow_blank=True, default="")
+    email = serializers.EmailField(required=False, allow_blank=True, default="")
+    organization = serializers.CharField(max_length=150, required=False, allow_blank=True, default="")
+    avatar_url = serializers.CharField(required=False, allow_blank=True, default="")
+    is_verified = serializers.BooleanField(required=False, default=True)
+    is_on_exi = serializers.BooleanField(required=False, default=True)
+    notes = serializers.CharField(max_length=500, required=False, allow_blank=True, default="")
+    vcard_raw = serializers.CharField(required=False, allow_blank=True, default="")
+
+    def validate(self, data):
+        if not data.get("name", "").strip():
+            raise serializers.ValidationError({"name": "Contact name is required."})
+        if not any([data.get("phone"), data.get("exi_id"), data.get("email")]):
+            raise serializers.ValidationError("At least one contact method (phone, exi_id, or email) is required.")
+        return data
+
+
+class LocationAttachmentSerializer(serializers.Serializer):
+    """Attachment: Share GPS location coordinates."""
+    latitude = serializers.FloatField(required=True)
+    longitude = serializers.FloatField(required=True)
+    name = serializers.CharField(max_length=200, required=False, allow_blank=True, default="")
+    address = serializers.CharField(max_length=500, required=False, allow_blank=True, default="")
+    is_live = serializers.BooleanField(required=False, default=False)
+    live_duration_minutes = serializers.IntegerField(required=False, default=0, min_value=0, max_value=1440)
+
+    def validate(self, data):
+        lat = data["latitude"]
+        lng = data["longitude"]
+        if not (-90.0 <= lat <= 90.0):
+            raise serializers.ValidationError({"latitude": "Latitude must be between -90 and 90."})
+        if not (-180.0 <= lng <= 180.0):
+            raise serializers.ValidationError({"longitude": "Longitude must be between -180 and 180."})
+        return data
+
+
+class TimeCapsuleAttachmentSerializer(serializers.Serializer):
+    """Attachment: Time Capsule scheduled message with lock/unlock rules."""
+    content = serializers.CharField(max_length=5000, required=True)
+    unlock_at = serializers.DateTimeField(required=True)
+    title = serializers.CharField(max_length=150, required=False, allow_blank=True, default="")
+    lock_hint = serializers.CharField(max_length=300, required=False, allow_blank=True, default="")
+    theme = serializers.CharField(max_length=50, required=False, default="golden")
+
+    def validate_unlock_at(self, value):
+        from django.utils import timezone
+        if value <= timezone.now():
+            raise serializers.ValidationError("Time Capsule unlock date must be in the future.")
+        return value
+
+
+class ExiPopAttachmentSerializer(serializers.Serializer):
+    """Attachment: EXI Pop interactive ephemeral surprise."""
+    POP_TYPES = (
+        ("confetti", "Confetti Burst"),
+        ("buzz", "Nudge & Buzz"),
+        ("scratch_card", "Scratch Card Reveal"),
+        ("flash", "Flash Pop"),
+        ("fireworks", "Fireworks Display"),
+        ("heartbeat", "Heartbeat Pulse"),
+        ("gift_box", "Gift Box Open"),
+    )
+    pop_type = serializers.ChoiceField(choices=POP_TYPES, default="confetti")
+    content = serializers.CharField(max_length=1000, required=False, allow_blank=True, default="")
+    effect = serializers.CharField(max_length=50, required=False, default="burst")
+    sound = serializers.CharField(max_length=50, required=False, default="pop")
+    auto_dismiss_seconds = serializers.IntegerField(required=False, default=5, min_value=0, max_value=60)
+    interactive_data = serializers.DictField(required=False, default=dict)
+
+
+class UnifiedAttachmentSerializer(serializers.Serializer):
+    """
+    Unified attachment intake serializer for the 7 Attachment Menu actions:
+    Camera, Photos, Documents, Contacts, Location, Time Capsule, EXI Pop.
+    """
+    ATTACHMENT_TYPES = (
+        ("camera", "Camera"),
+        ("photos", "Photos"),
+        ("documents", "Documents"),
+        ("contacts", "Contacts"),
+        ("contact", "Contact Card"),
+        ("location", "Location"),
+        ("time_capsule", "Time Capsule"),
+        ("capsule", "Time Capsule"),
+        ("exi_pop", "EXI Pop"),
+        ("pop", "EXI Pop"),
+    )
+    attachment_type = serializers.ChoiceField(choices=ATTACHMENT_TYPES)
+    # Media inputs (Camera, Photos, Documents)
+    file = serializers.FileField(required=False, allow_null=True)
+    caption = serializers.CharField(required=False, allow_blank=True, max_length=2000, default="")
+    media_type = serializers.CharField(required=False, allow_blank=True, default="")
+    # Structured inputs
+    contact = ContactAttachmentSerializer(required=False)
+    location = LocationAttachmentSerializer(required=False)
+    time_capsule = TimeCapsuleAttachmentSerializer(required=False)
+    exi_pop = ExiPopAttachmentSerializer(required=False)
 
 
 class StartConversationSerializer(serializers.Serializer):

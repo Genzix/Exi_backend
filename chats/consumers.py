@@ -159,6 +159,44 @@ class ChatConsumer(AsyncWebsocketConsumer):
                             "status": result["status"],
                         },
                     )
+        elif action == "send_attachment":
+            att_type = data.get("attachment_type") or data.get("type")
+            att_payload = data.get("data") or data.get("payload") or {}
+            allowed, detail = await self._check_send_allowed(
+                self.scope["user"].id, self.conversation_id
+            )
+            if not allowed:
+                await self._send_error(detail)
+                return
+
+            message_data = await self._create_attachment_message(
+                self.scope["user"].id,
+                self.conversation_id,
+                att_type,
+                att_payload,
+            )
+            if message_data:
+                await self.channel_layer.group_send(
+                    self.room_group_name,
+                    {
+                        "type": "chat_message",
+                        "message": message_data,
+                    },
+                )
+        elif action == "open_exi_pop":
+            msg_id = data.get("message_id")
+            if msg_id:
+                pop_info = await self._mark_exi_pop_opened(
+                    self.scope["user"].id, self.conversation_id, msg_id
+                )
+                if pop_info:
+                    await self.channel_layer.group_send(
+                        self.room_group_name,
+                        {
+                            "type": "exi_pop_opened",
+                            **pop_info,
+                        },
+                    )
 
     async def chat_message(self, event):
         await self.send(
@@ -249,6 +287,22 @@ class ChatConsumer(AsyncWebsocketConsumer):
             )
         )
 
+    async def exi_pop_opened(self, event):
+        await self.send(
+            text_data=json.dumps(
+                {
+                    "type": "exi_pop_opened",
+                    "message_id": event["message_id"],
+                    "opened_by": event["opened_by"],
+                    "opened_by_name": event.get("opened_by_name", ""),
+                    "pop_type": event.get("pop_type", "confetti"),
+                    "effect": event.get("effect", "burst"),
+                    "sound": event.get("sound", "pop"),
+                },
+                cls=DjangoJSONEncoder,
+            )
+        )
+
     async def _send_error(self, detail):
         await self.send(
             text_data=json.dumps(
@@ -331,6 +385,137 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
         notify_new_message(msg)
         return MessageSerializer(msg).data
+
+    @sync_to_async
+    def _create_attachment_message(self, user_id, conversation_id, att_type, att_payload):
+        import json
+        from django.db.models import F
+        from django.utils import timezone
+        from .models import Conversation, ConversationParticipant, Message
+        from .serializers import MessageSerializer
+
+        att_type = (att_type or "").lower()
+        if att_type in ("contacts", "contact"):
+            msg = Message.objects.create(
+                conversation_id=conversation_id,
+                sender_id=user_id,
+                content=json.dumps({
+                    "attachment_type": "contact",
+                    "name": att_payload.get("name", ""),
+                    "phone": att_payload.get("phone", ""),
+                    "exi_id": att_payload.get("exi_id", ""),
+                    "email": att_payload.get("email", ""),
+                    "organization": att_payload.get("organization", ""),
+                    "notes": att_payload.get("notes", ""),
+                }),
+                message_type="contact",
+                status="sent",
+            )
+        elif att_type in ("location", "geo"):
+            msg = Message.objects.create(
+                conversation_id=conversation_id,
+                sender_id=user_id,
+                content=json.dumps({
+                    "attachment_type": "location",
+                    "latitude": float(att_payload.get("latitude", 0)),
+                    "longitude": float(att_payload.get("longitude", 0)),
+                    "name": att_payload.get("name", ""),
+                    "address": att_payload.get("address", ""),
+                    "is_live": bool(att_payload.get("is_live", False)),
+                    "live_duration_minutes": int(att_payload.get("live_duration_minutes", 0)),
+                }),
+                message_type="location",
+                status="sent",
+            )
+        elif att_type in ("time_capsule", "capsule"):
+            from datetime import datetime
+            unlock_str = att_payload.get("unlock_at")
+            unlock_at = timezone.now()
+            if unlock_str:
+                try:
+                    unlock_at = datetime.fromisoformat(unlock_str.replace("Z", "+00:00"))
+                    if timezone.is_naive(unlock_at):
+                        unlock_at = timezone.make_aware(unlock_at)
+                except Exception:
+                    pass
+            msg = Message.objects.create(
+                conversation_id=conversation_id,
+                sender_id=user_id,
+                content=json.dumps({
+                    "attachment_type": "time_capsule",
+                    "title": att_payload.get("title", "Time Capsule"),
+                    "secret_content": att_payload.get("content", ""),
+                    "lock_hint": att_payload.get("lock_hint", ""),
+                    "theme": att_payload.get("theme", "golden"),
+                    "unlock_at": unlock_at.isoformat(),
+                    "sealed_at": timezone.now().isoformat(),
+                    "is_unlocked": False,
+                }),
+                message_type="capsule",
+                scheduled_for=unlock_at,
+                is_scheduled=True,
+                status="scheduled",
+            )
+        elif att_type in ("exi_pop", "pop"):
+            msg = Message.objects.create(
+                conversation_id=conversation_id,
+                sender_id=user_id,
+                content=json.dumps({
+                    "attachment_type": "exi_pop",
+                    "pop_type": att_payload.get("pop_type", "confetti"),
+                    "text": att_payload.get("content", ""),
+                    "effect": att_payload.get("effect", "burst"),
+                    "sound": att_payload.get("sound", "pop"),
+                    "auto_dismiss_seconds": int(att_payload.get("auto_dismiss_seconds", 5)),
+                    "interactive_data": att_payload.get("interactive_data", {}),
+                    "is_opened": False,
+                    "created_at": timezone.now().isoformat(),
+                }),
+                message_type="exi_pop",
+                status="sent",
+            )
+        else:
+            return None
+
+        Conversation.objects.filter(id=conversation_id).update(updated_at=timezone.now())
+        ConversationParticipant.objects.filter(conversation_id=conversation_id).exclude(
+            user_id=user_id
+        ).update(unread_count=F("unread_count") + 1, deleted_at=None)
+
+        from .utils import notify_new_message
+        notify_new_message(msg)
+        return MessageSerializer(msg).data
+
+    @sync_to_async
+    def _mark_exi_pop_opened(self, user_id, conversation_id, message_id):
+        import json
+        from django.contrib.auth import get_user_model
+        from .models import Message
+
+        try:
+            msg = Message.objects.get(id=message_id, conversation_id=conversation_id, message_type="exi_pop")
+            try:
+                data = json.loads(msg.content)
+            except Exception:
+                data = {}
+            data["is_opened"] = True
+            data["opened_by"] = user_id
+            msg.content = json.dumps(data)
+            msg.save(update_fields=["content"])
+
+            User = get_user_model()
+            u = User.objects.filter(id=user_id).first()
+            name = getattr(u, "display_name", None) or getattr(u, "username", "User")
+            return {
+                "message_id": str(msg.id),
+                "opened_by": user_id,
+                "opened_by_name": name,
+                "pop_type": data.get("pop_type", "confetti"),
+                "effect": data.get("effect", "burst"),
+                "sound": data.get("sound", "pop"),
+            }
+        except Exception:
+            return None
 
     @sync_to_async
     def _update_message_status(self, user_id, message_id, new_status):

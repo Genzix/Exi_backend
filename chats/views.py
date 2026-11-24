@@ -4,7 +4,7 @@ from django.db.models import F, Sum
 from django.http import FileResponse
 from django.urls import reverse
 from rest_framework import generics, permissions, status
-from rest_framework.parsers import FormParser, MultiPartParser
+from rest_framework.parsers import FormParser, MultiPartParser, JSONParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.utils import timezone
@@ -23,6 +23,11 @@ from .serializers import (
     MessageSerializer,
     SendMessageSerializer,
     StartConversationSerializer,
+    ContactAttachmentSerializer,
+    LocationAttachmentSerializer,
+    TimeCapsuleAttachmentSerializer,
+    ExiPopAttachmentSerializer,
+    UnifiedAttachmentSerializer,
 )
 from .utils import broadcast_chat_message, broadcast_message_status
 
@@ -747,9 +752,33 @@ class ChatPermissionsView(APIView):
 
         from .chat_permissions import get_chat_permissions_display
         perms = get_chat_permissions_display(chat_id, request.user.id)
+
+        other_user = None
+        banner_text = "Members can"
+        if participant.conversation.type == "direct":
+            other = participant.conversation.participants.exclude(id=request.user.id).first()
+            if other:
+                first_name = (getattr(other, "first_name", "") or "").strip()
+                name = first_name or (getattr(other, "display_name", "") or other.username)
+                banner_text = f"{name} can"
+                other_user = {
+                    "id": other.id,
+                    "first_name": first_name,
+                    "display_name": getattr(other, "display_name", other.username),
+                    "username": other.username,
+                    "banner_text": banner_text,
+                }
+
         return Response({
             "chat_id": str(chat_id),
+            "banner_text": banner_text,
+            "other_user": other_user,
             "permissions": perms,
+            "chips": [
+                {"id": "message", "label": "Message", "enabled": perms.get("messages_enabled", True)},
+                {"id": "call", "label": "Call", "enabled": perms.get("calls_enabled", True)},
+                {"id": "media", "label": "Media", "enabled": perms.get("media_enabled", True)},
+            ],
         })
 
     def patch(self, request, chat_id):
@@ -890,6 +919,771 @@ class SendMediaMessageView(APIView):
             MessageSerializer(msg, context={"request": request}).data,
             status=status.HTTP_201_CREATED,
         )
+
+
+class ChatAttachmentMenuView(APIView):
+    """
+    GET /api/chats/<chat_id>/attachments/menu/
+    Returns the Attachment Menu configuration for the 7 actions:
+    1. Camera (Live capture photo/video)
+    2. Photos (Device gallery media)
+    3. Documents (PDFs, docs, spreadsheets, files)
+    4. Contacts (Contact cards)
+    5. Location (GPS coordinates & live location)
+    6. Time Capsule (Scheduled locked messages with future reveal)
+    7. EXI Pop (Interactive surprise pop with special effects)
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, chat_id):
+        try:
+            participant = ConversationParticipant.objects.select_related("conversation").get(
+                user=request.user, conversation_id=chat_id, deleted_at__isnull=True
+            )
+        except ConversationParticipant.DoesNotExist:
+            return Response({"detail": "Not a participant."}, status=status.HTTP_403_FORBIDDEN)
+
+        from .chat_permissions import check_chat_media_permission, check_chat_message_permission, get_chat_permissions_display
+        media_allowed, _ = check_chat_media_permission(chat_id, request.user.id)
+        messages_allowed, _ = check_chat_message_permission(chat_id, request.user.id)
+        perms_display = get_chat_permissions_display(chat_id, request.user.id)
+
+        menu_items = [
+            {
+                "id": "camera",
+                "title": "Camera",
+                "description": "Capture a live photo or record a video",
+                "icon": "camera",
+                "category": "media",
+                "supported_media": ["image", "video"],
+                "is_enabled": media_allowed,
+                "action_endpoint": f"/api/chats/{chat_id}/attachments/send/",
+            },
+            {
+                "id": "photos",
+                "title": "Photos & Videos",
+                "description": "Share photos or videos from device gallery",
+                "icon": "photo",
+                "category": "media",
+                "supported_media": ["image", "video"],
+                "is_enabled": media_allowed,
+                "action_endpoint": f"/api/chats/{chat_id}/attachments/send/",
+            },
+            {
+                "id": "documents",
+                "title": "Documents",
+                "description": "Share PDFs, documents, spreadsheets, and files",
+                "icon": "document",
+                "category": "media",
+                "supported_media": ["document"],
+                "is_enabled": media_allowed,
+                "action_endpoint": f"/api/chats/{chat_id}/attachments/send/",
+            },
+            {
+                "id": "contacts",
+                "title": "Contacts",
+                "description": "Share a contact card with name, phone, or EXI ID",
+                "icon": "contact",
+                "category": "structured",
+                "is_enabled": messages_allowed,
+                "action_endpoint": f"/api/chats/{chat_id}/attachments/contact/",
+            },
+            {
+                "id": "location",
+                "title": "Location",
+                "description": "Share your current or live GPS coordinates",
+                "icon": "location",
+                "category": "structured",
+                "is_enabled": messages_allowed,
+                "action_endpoint": f"/api/chats/{chat_id}/attachments/location/",
+            },
+            {
+                "id": "time_capsule",
+                "title": "Time Capsule",
+                "description": "Schedule a locked message to open on a future date",
+                "icon": "time_capsule",
+                "category": "interactive",
+                "is_enabled": messages_allowed,
+                "action_endpoint": f"/api/chats/{chat_id}/attachments/time-capsule/",
+            },
+            {
+                "id": "exi_pop",
+                "title": "EXI Pop",
+                "description": "Send an interactive surprise pop with burst animation",
+                "icon": "sparkles",
+                "category": "interactive",
+                "is_enabled": messages_allowed,
+                "pop_types": ["confetti", "buzz", "scratch_card", "flash", "fireworks", "heartbeat", "gift_box"],
+                "action_endpoint": f"/api/chats/{chat_id}/attachments/exi-pop/",
+            },
+        ]
+
+        return Response({
+            "chat_id": str(chat_id),
+            "conversation_type": participant.conversation.type,
+            "attachment_menu": menu_items,
+            "permissions": perms_display,
+        })
+
+
+class ChatAttachmentSendView(APIView):
+    """
+    POST /api/chats/<chat_id>/attachments/send/
+    POST /api/chats/<chat_id>/attachments/
+    Unified Attachment API executing:
+    Save and validate -> Create message -> Deliver via WebSocket
+    Handles all 7 options from the attachment menu:
+    Camera, Photos, Documents, Contacts, Location, Time Capsule, EXI Pop.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def post(self, request, chat_id):
+        import json
+        try:
+            participant = ConversationParticipant.objects.select_related("conversation").get(
+                user=request.user, conversation_id=chat_id, deleted_at__isnull=True
+            )
+        except ConversationParticipant.DoesNotExist:
+            return Response({"detail": "Not a participant."}, status=status.HTTP_403_FORBIDDEN)
+
+        blocked_response = guard_message_send(request, participant.conversation)
+        if blocked_response:
+            return blocked_response
+
+        # Determine attachment type
+        att_type = (request.data.get("attachment_type") or request.data.get("type") or "").strip().lower()
+
+        # If not explicitly specified, deduce from payload keys
+        if not att_type:
+            if "latitude" in request.data or "location" in request.data:
+                att_type = "location"
+            elif "contact" in request.data or ("name" in request.data and ("phone" in request.data or "exi_id" in request.data or "email" in request.data)):
+                att_type = "contacts"
+            elif "unlock_at" in request.data or "time_capsule" in request.data:
+                att_type = "time_capsule"
+            elif "pop_type" in request.data or "exi_pop" in request.data:
+                att_type = "exi_pop"
+            elif "file" in request.FILES or "file" in request.data:
+                uploaded = request.FILES.get("file") or request.data.get("file")
+                mime = (getattr(uploaded, "content_type", "") or "").lower()
+                att_type = "documents" if mime.startswith(("application/", "text/")) else "photos"
+            else:
+                return Response(
+                    {"detail": "attachment_type is required: camera, photos, documents, contacts, location, time_capsule, or exi_pop."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        from .chat_permissions import check_chat_media_permission, check_chat_message_permission
+
+        # 1. Camera / Photos / Documents
+        if att_type in ("camera", "photos", "photo", "documents", "document", "media"):
+            media_allowed, media_err = check_chat_media_permission(chat_id, request.user.id)
+            if not media_allowed:
+                return Response({"detail": media_err}, status=status.HTTP_403_FORBIDDEN)
+
+            uploaded_file = request.FILES.get("file") or request.data.get("file")
+            if not uploaded_file:
+                return Response({"detail": "A file is required for media attachments."}, status=status.HTTP_400_BAD_REQUEST)
+
+            caption = request.data.get("caption", "")
+            mime = (getattr(uploaded_file, "content_type", "") or "").lower()
+
+            if att_type in ("documents", "document") or mime.startswith(("application/", "text/")):
+                media_type = "document"
+            elif mime.startswith("video/"):
+                media_type = "video"
+            else:
+                media_type = "image"
+
+            msg = Message.objects.create(
+                conversation_id=chat_id,
+                sender=request.user,
+                content=caption,
+                message_type=media_type,
+                attachment=uploaded_file,
+                attachment_name=uploaded_file.name,
+                attachment_mime_type=mime,
+                attachment_size=uploaded_file.size,
+                status="sent",
+            )
+
+        # 2. Contacts
+        elif att_type in ("contacts", "contact"):
+            msg_allowed, msg_err = check_chat_message_permission(chat_id, request.user.id)
+            if not msg_allowed:
+                return Response({"detail": msg_err}, status=status.HTTP_403_FORBIDDEN)
+
+            raw_c = request.data.get("contact") or request.data
+            ser = ContactAttachmentSerializer(data=raw_c)
+            ser.is_valid(raise_exception=True)
+            cdata = ser.validated_data
+
+            phone = cdata.get("phone", "")
+            exi_id = cdata.get("exi_id", "")
+            matched_user = None
+            if phone:
+                matched_user = User.objects.filter(phone=phone).first()
+            if not matched_user and exi_id:
+                matched_user = User.objects.filter(exi_id=exi_id).first()
+
+            is_on_exi = bool(matched_user) or cdata.get("is_on_exi", True)
+            avatar_url = cdata.get("avatar_url", "")
+            if not avatar_url and matched_user and getattr(matched_user, "profile_photo", None):
+                try:
+                    avatar_url = request.build_absolute_uri(matched_user.profile_photo.url)
+                except Exception:
+                    pass
+
+            req_status = request.data.get("status")
+            msg_status = "failed" if req_status == "failed" else "sent"
+
+            msg = Message.objects.create(
+                conversation_id=chat_id,
+                sender=request.user,
+                content=json.dumps({
+                    "attachment_type": "contact",
+                    "name": cdata["name"],
+                    "role": cdata.get("role") or cdata.get("title") or "",
+                    "phone": phone,
+                    "phone_type": cdata.get("phone_type") or "Landline",
+                    "country": cdata.get("country") or "India",
+                    "exi_id": exi_id or (matched_user.exi_id if matched_user else ""),
+                    "email": cdata.get("email", ""),
+                    "organization": cdata.get("organization", ""),
+                    "avatar_url": avatar_url,
+                    "is_verified": cdata.get("is_verified", True),
+                    "is_on_exi": is_on_exi,
+                    "notes": cdata.get("notes", ""),
+                    "vcard_raw": cdata.get("vcard_raw", ""),
+                }),
+                message_type="contact",
+                status=msg_status,
+            )
+
+        # 3. Location
+        elif att_type in ("location", "geo"):
+            msg_allowed, msg_err = check_chat_message_permission(chat_id, request.user.id)
+            if not msg_allowed:
+                return Response({"detail": msg_err}, status=status.HTTP_403_FORBIDDEN)
+
+            raw_loc = request.data.get("location") or request.data
+            ser = LocationAttachmentSerializer(data=raw_loc)
+            ser.is_valid(raise_exception=True)
+            ldata = ser.validated_data
+
+            msg = Message.objects.create(
+                conversation_id=chat_id,
+                sender=request.user,
+                content=json.dumps({
+                    "attachment_type": "location",
+                    "latitude": ldata["latitude"],
+                    "longitude": ldata["longitude"],
+                    "name": ldata.get("name", ""),
+                    "address": ldata.get("address", ""),
+                    "is_live": ldata.get("is_live", False),
+                    "live_duration_minutes": ldata.get("live_duration_minutes", 0),
+                    "shared_at": timezone.now().isoformat(),
+                }),
+                message_type="location",
+                status="sent",
+            )
+
+        # 4. Time Capsule
+        elif att_type in ("time_capsule", "capsule"):
+            msg_allowed, msg_err = check_chat_message_permission(chat_id, request.user.id)
+            if not msg_allowed:
+                return Response({"detail": msg_err}, status=status.HTTP_403_FORBIDDEN)
+
+            raw_tc = request.data.get("time_capsule") or request.data
+            ser = TimeCapsuleAttachmentSerializer(data=raw_tc)
+            ser.is_valid(raise_exception=True)
+            tc_data = ser.validated_data
+
+            unlock_at = tc_data["unlock_at"]
+            msg = Message.objects.create(
+                conversation_id=chat_id,
+                sender=request.user,
+                content=json.dumps({
+                    "attachment_type": "time_capsule",
+                    "title": tc_data.get("title") or "Time Capsule",
+                    "secret_content": tc_data["content"],
+                    "lock_hint": tc_data.get("lock_hint", ""),
+                    "theme": tc_data.get("theme", "golden"),
+                    "unlock_at": unlock_at.isoformat(),
+                    "sealed_at": timezone.now().isoformat(),
+                    "is_unlocked": False,
+                }),
+                message_type="capsule",
+                scheduled_for=unlock_at,
+                is_scheduled=True,
+                status="scheduled",
+            )
+
+        # 5. EXI Pop
+        elif att_type in ("exi_pop", "pop"):
+            msg_allowed, msg_err = check_chat_message_permission(chat_id, request.user.id)
+            if not msg_allowed:
+                return Response({"detail": msg_err}, status=status.HTTP_403_FORBIDDEN)
+
+            raw_pop = request.data.get("exi_pop") or request.data
+            ser = ExiPopAttachmentSerializer(data=raw_pop)
+            ser.is_valid(raise_exception=True)
+            pop_data = ser.validated_data
+
+            msg = Message.objects.create(
+                conversation_id=chat_id,
+                sender=request.user,
+                content=json.dumps({
+                    "attachment_type": "exi_pop",
+                    "pop_type": pop_data.get("pop_type", "confetti"),
+                    "text": pop_data.get("content", ""),
+                    "effect": pop_data.get("effect", "burst"),
+                    "sound": pop_data.get("sound", "pop"),
+                    "auto_dismiss_seconds": pop_data.get("auto_dismiss_seconds", 5),
+                    "interactive_data": pop_data.get("interactive_data", {}),
+                    "is_opened": False,
+                    "created_at": timezone.now().isoformat(),
+                }),
+                message_type="exi_pop",
+                status="sent",
+            )
+
+        else:
+            return Response(
+                {"detail": f"Unknown attachment type '{att_type}'. Supported: camera, photos, documents, contacts, location, time_capsule, exi_pop."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Save and validate -> update conversation & unread count
+        Conversation.objects.filter(id=chat_id).update(updated_at=timezone.now())
+        ConversationParticipant.objects.filter(conversation_id=chat_id).exclude(
+            user=request.user
+        ).update(unread_count=F("unread_count") + 1, deleted_at=None)
+
+        # Deliver via WebSocket
+        broadcast_chat_message(chat_id, msg)
+
+        return Response(
+            MessageSerializer(msg, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class ChatContactAttachmentView(APIView):
+    """
+    POST /api/chats/<chat_id>/attachments/contact/
+    Dedicated endpoint for sharing contact data.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, chat_id):
+        data = dict(request.data)
+        data["attachment_type"] = "contact"
+        request._full_data = data
+        return ChatAttachmentSendView().post(request, chat_id)
+
+
+class ChatLocationAttachmentView(APIView):
+    """
+    POST /api/chats/<chat_id>/attachments/location/
+    Dedicated endpoint for sharing GPS coordinates & live location.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, chat_id):
+        data = dict(request.data)
+        data["attachment_type"] = "location"
+        request._full_data = data
+        return ChatAttachmentSendView().post(request, chat_id)
+
+
+class ChatTimeCapsuleAttachmentView(APIView):
+    """
+    POST /api/chats/<chat_id>/attachments/time-capsule/
+    Dedicated endpoint for scheduling and sealing a Time Capsule.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, chat_id):
+        data = dict(request.data)
+        data["attachment_type"] = "time_capsule"
+        request._full_data = data
+        return ChatAttachmentSendView().post(request, chat_id)
+
+
+class ChatTimeCapsuleDetailView(APIView):
+    """
+    GET /api/chats/<chat_id>/attachments/time-capsule/<message_id>/
+    Inspect a Time Capsule: reveals secret content once unlock_at is reached.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, chat_id, message_id):
+        import json
+        try:
+            ConversationParticipant.objects.get(
+                user=request.user, conversation_id=chat_id, deleted_at__isnull=True
+            )
+        except ConversationParticipant.DoesNotExist:
+            return Response({"detail": "Not a participant."}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            msg = Message.objects.get(id=message_id, conversation_id=chat_id, message_type="capsule")
+        except Message.DoesNotExist:
+            return Response({"detail": "Time Capsule message not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            data = json.loads(msg.content)
+        except Exception:
+            data = {}
+
+        now = timezone.now()
+        is_sender = request.user.id == msg.sender_id
+        is_unlocked = msg.scheduled_for and now >= msg.scheduled_for
+
+        time_left_seconds = 0
+        if msg.scheduled_for and msg.scheduled_for > now:
+            time_left_seconds = int((msg.scheduled_for - now).total_seconds())
+
+        response_data = {
+            "message_id": str(msg.id),
+            "sender_id": msg.sender_id,
+            "title": data.get("title", "Time Capsule"),
+            "lock_hint": data.get("lock_hint", ""),
+            "theme": data.get("theme", "golden"),
+            "unlock_at": msg.scheduled_for.isoformat() if msg.scheduled_for else None,
+            "is_unlocked": is_unlocked,
+            "countdown_seconds": time_left_seconds,
+        }
+
+        if is_unlocked or is_sender:
+            response_data["secret_content"] = data.get("secret_content") or data.get("content") or msg.content
+        else:
+            response_data["secret_content"] = None
+            response_data["message"] = f"Sealed! Unlocks in {time_left_seconds} seconds."
+
+        return Response(response_data)
+
+
+class ChatExiPopAttachmentView(APIView):
+    """
+    POST /api/chats/<chat_id>/attachments/exi-pop/
+    Dedicated endpoint for sending an interactive EXI Pop surprise.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, chat_id):
+        data = dict(request.data)
+        data["attachment_type"] = "exi_pop"
+        request._full_data = data
+        return ChatAttachmentSendView().post(request, chat_id)
+
+
+class ChatExiPopOpenView(APIView):
+    """
+    POST /api/chats/<chat_id>/attachments/exi-pop/<message_id>/open/
+    Record that recipient opened the pop and broadcast trigger event to WebSocket.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, chat_id, message_id):
+        import json
+        from asgiref.sync import async_to_sync
+        from channels.layers import get_channel_layer
+
+        try:
+            ConversationParticipant.objects.get(
+                user=request.user, conversation_id=chat_id, deleted_at__isnull=True
+            )
+        except ConversationParticipant.DoesNotExist:
+            return Response({"detail": "Not a participant."}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            msg = Message.objects.get(id=message_id, conversation_id=chat_id, message_type="exi_pop")
+        except Message.DoesNotExist:
+            return Response({"detail": "EXI Pop not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            data = json.loads(msg.content)
+        except Exception:
+            data = {}
+
+        data["is_opened"] = True
+        data["opened_by"] = request.user.id
+        data["opened_at"] = timezone.now().isoformat()
+        msg.content = json.dumps(data)
+        msg.save(update_fields=["content"])
+
+        # Broadcast real-time interactive trigger event to all participants
+        channel_layer = get_channel_layer()
+        if channel_layer:
+            async_to_sync(channel_layer.group_send)(
+                f"chat_{chat_id}",
+                {
+                    "type": "exi_pop_opened",
+                    "message_id": str(msg.id),
+                    "pop_type": data.get("pop_type", "confetti"),
+                    "effect": data.get("effect", "burst"),
+                    "sound": data.get("sound", "pop"),
+                    "opened_by": request.user.id,
+                    "opened_by_name": getattr(request.user, "display_name", None) or request.user.username,
+                }
+            )
+
+        return Response({
+            "detail": "EXI Pop opened successfully.",
+            "message_id": str(msg.id),
+            "pop_type": data.get("pop_type", "confetti"),
+            "effect": data.get("effect", "burst"),
+            "sound": data.get("sound", "pop"),
+            "text": data.get("text", ""),
+            "is_opened": True,
+        })
+
+
+class ContactCardDetailView(APIView):
+    """
+    GET /api/chats/messages/<message_id>/contact-card/
+    GET /api/chats/<chat_id>/messages/<message_id>/contact-card/
+    Returns the rich Contact Sheet details shown in Image 2:
+    - Contact Avatar + Verified checkmark badge
+    - Full Name: "Rahul Kumar"
+    - Role: "Software Engineer"
+    - "On EXI" badge
+    - Phone details: Country • Type ("India • Landline"), Number, Copyable
+    - Role details: "Software Engineer"
+    - Actions: Message button, Call button, Add contact button
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, message_id, chat_id=None):
+        import json
+        try:
+            msg = Message.objects.get(id=message_id, message_type="contact")
+        except Message.DoesNotExist:
+            return Response({"detail": "Contact message not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if not ConversationParticipant.objects.filter(
+            user=request.user, conversation_id=msg.conversation_id, deleted_at__isnull=True
+        ).exists():
+            return Response({"detail": "Not a participant."}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            cdata = json.loads(msg.content)
+        except Exception:
+            cdata = {}
+
+        phone = cdata.get("phone", "")
+        exi_id = cdata.get("exi_id", "")
+        matched_user = None
+        if phone:
+            matched_user = User.objects.filter(phone=phone).first()
+        if not matched_user and exi_id:
+            matched_user = User.objects.filter(exi_id=exi_id).first()
+
+        name = cdata.get("name", "Contact")
+        role = cdata.get("role") or cdata.get("title") or "Software Engineer"
+        phone_type = cdata.get("phone_type") or "Landline"
+        country = cdata.get("country") or "India"
+        is_on_exi = bool(matched_user) or cdata.get("is_on_exi", True)
+        is_verified = cdata.get("is_verified", True)
+
+        avatar_url = cdata.get("avatar_url")
+        if not avatar_url and matched_user and getattr(matched_user, "profile_photo", None):
+            try:
+                avatar_url = request.build_absolute_uri(matched_user.profile_photo.url)
+            except Exception:
+                pass
+
+        # Check if already in user's contacts
+        from accounts.user_preferences import get_section_preferences
+        contacts_pref = get_section_preferences(request.user.id, "contacts") or {}
+        contact_list = contacts_pref.get("contact_list", [])
+        is_saved = any(c.get("phone_number") == phone or c.get("phone") == phone for c in contact_list) if phone else False
+
+        return Response({
+            "message_id": str(msg.id),
+            "contact": {
+                "name": name,
+                "role": role,
+                "avatar_url": avatar_url,
+                "is_verified": is_verified,
+                "is_on_exi": is_on_exi,
+                "badge": "On EXI" if is_on_exi else "Not on EXI",
+                "phone_details": {
+                    "label": f"{country} • {phone_type}",
+                    "number": phone,
+                    "country": country,
+                    "type": phone_type,
+                    "can_copy": True,
+                },
+                "role_details": {
+                    "label": "Role",
+                    "value": role,
+                },
+                "matched_user": {
+                    "id": matched_user.id if matched_user else None,
+                    "exi_id": matched_user.exi_id if matched_user else exi_id,
+                    "username": matched_user.username if matched_user else None,
+                } if matched_user else None,
+                "actions": {
+                    "can_message": True,
+                    "can_call": True,
+                    "is_saved_in_contacts": is_saved,
+                    "start_chat_endpoint": "/api/chats/start/",
+                    "start_chat_payload": {
+                        "user_id": matched_user.id if matched_user else None,
+                        "exi_id": matched_user.exi_id if matched_user else exi_id,
+                        "phone_number": phone,
+                    },
+                    "call_endpoint": "/api/calls/initiate/",
+                    "call_payload": {
+                        "callee_id": matched_user.id if matched_user else None,
+                        "call_type": "voice",
+                    },
+                    "save_contact_endpoint": f"/api/chats/messages/{msg.id}/save-contact/",
+                }
+            }
+        })
+
+
+class ContactCardSaveContactView(APIView):
+    """
+    POST /api/chats/messages/<message_id>/save-contact/
+    POST /api/chats/<chat_id>/messages/<message_id>/save-contact/
+    Implements the "[ + Add contact ]" button from the Contact Sheet in Image 2.
+    Adds the shared contact directly into the user's address book.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, message_id, chat_id=None):
+        import json
+        import uuid
+        try:
+            msg = Message.objects.get(id=message_id, message_type="contact")
+        except Message.DoesNotExist:
+            return Response({"detail": "Contact message not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            cdata = json.loads(msg.content)
+        except Exception:
+            return Response({"detail": "Invalid contact data in message."}, status=status.HTTP_400_BAD_REQUEST)
+
+        from accounts.user_preferences import get_section_preferences, update_section_preferences
+        contacts_pref = get_section_preferences(request.user.id, "contacts") or {}
+        contact_list = contacts_pref.get("contact_list", [])
+
+        name = cdata.get("name", "").strip()
+        parts = name.split(" ", 1)
+        first_name = parts[0]
+        last_name = parts[1] if len(parts) > 1 else ""
+        phone = cdata.get("phone", "").strip()
+
+        # Check if already saved
+        existing = next((c for c in contact_list if c.get("phone_number") == phone or (c.get("first_name") == first_name and c.get("last_name") == last_name)), None)
+        if existing:
+            return Response({
+                "detail": f"{name} is already in your contacts.",
+                "contact": existing,
+                "is_new": False,
+            }, status=status.HTTP_200_OK)
+
+        new_entry = {
+            "id": f"cnt-{uuid.uuid4().hex[:8]}",
+            "first_name": first_name,
+            "last_name": last_name,
+            "name": name,
+            "phone_number": phone,
+            "role": cdata.get("role", ""),
+            "organization": cdata.get("organization", ""),
+            "created_at": timezone.now().isoformat(),
+        }
+        contact_list.append(new_entry)
+        update_section_preferences(request.user.id, "contacts", {"contact_list": contact_list})
+
+        return Response({
+            "detail": f"{name} added to your contacts.",
+            "contact": new_entry,
+            "is_new": True,
+        }, status=status.HTTP_201_CREATED)
+
+
+class MessageRetryView(APIView):
+    """
+    POST /api/messages/<message_id>/retry/
+    POST /api/chats/<chat_id>/messages/<message_id>/retry/
+    Handles the "! Not sent • Tap to retry" state shown in Image 1.
+    Retries sending a previously failed message, validates permissions,
+    transitions status to 'sent', and broadcasts over WebSocket.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, message_id, chat_id=None):
+        try:
+            msg = Message.objects.get(id=message_id)
+        except Message.DoesNotExist:
+            return Response({"detail": "Message not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if msg.sender_id != request.user.id:
+            return Response({"detail": "Can only retry your own messages."}, status=status.HTTP_403_FORBIDDEN)
+
+        # Abuse & permission checks
+        blocked_resp = guard_message_send(request, msg.conversation)
+        if blocked_resp:
+            return blocked_resp
+
+        from .chat_permissions import check_chat_message_permission, check_chat_media_permission
+        if msg.message_type in ("image", "video", "document"):
+            allowed, err = check_chat_media_permission(msg.conversation_id, request.user.id)
+            if not allowed:
+                return Response({"detail": err}, status=status.HTTP_403_FORBIDDEN)
+        else:
+            allowed, err = check_chat_message_permission(msg.conversation_id, request.user.id)
+            if not allowed:
+                return Response({"detail": err}, status=status.HTTP_403_FORBIDDEN)
+
+        # Transition status from failed to sent
+        msg.status = "sent"
+        msg.created_at = timezone.now()
+        msg.save(update_fields=["status", "created_at"])
+
+        Conversation.objects.filter(id=msg.conversation_id).update(updated_at=timezone.now())
+        ConversationParticipant.objects.filter(conversation_id=msg.conversation_id).exclude(
+            user=request.user
+        ).update(unread_count=F("unread_count") + 1, deleted_at=None)
+
+        broadcast_chat_message(msg.conversation_id, msg)
+
+        return Response({
+            "detail": "Message re-sent successfully.",
+            "message": MessageSerializer(msg, context={"request": request}).data,
+        }, status=status.HTTP_200_OK)
+
+
+class MessageFailView(APIView):
+    """
+    POST /api/messages/<message_id>/fail/
+    POST /api/chats/<chat_id>/messages/<message_id>/fail/
+    Mark a message as failed to trigger the "! Not sent • Tap to retry" state.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, message_id, chat_id=None):
+        try:
+            msg = Message.objects.get(id=message_id, sender=request.user)
+        except Message.DoesNotExist:
+            return Response({"detail": "Message not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        msg.status = "failed"
+        msg.save(update_fields=["status"])
+
+        return Response({
+            "detail": "Message marked as failed.",
+            "message_id": str(msg.id),
+            "status": "failed",
+            "retry_hint": "Not sent • Tap to retry",
+        }, status=status.HTTP_200_OK)
 
 
 class DownloadAttachmentView(APIView):

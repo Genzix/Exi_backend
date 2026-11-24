@@ -41,6 +41,7 @@ class Message(models.Model):
         ('sent', 'Sent'),
         ('delivered', 'Delivered'),
         ('read', 'Read'),
+        ('failed', 'Failed'),
     )
     MESSAGE_TYPES = (
         ('text', 'Text'),
@@ -49,6 +50,10 @@ class Message(models.Model):
         ('document', 'Document'),
         ('audio', 'Audio'),
         ('voice', 'Voice Note'),
+        ('contact', 'Contact Card'),
+        ('location', 'Location'),
+        ('capsule', 'Time Capsule'),
+        ('exi_pop', 'EXI Pop'),
     )
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name='messages')
