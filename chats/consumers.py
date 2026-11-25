@@ -197,6 +197,21 @@ class ChatConsumer(AsyncWebsocketConsumer):
                             **pop_info,
                         },
                     )
+        elif action == "vote_poll":
+            msg_id = data.get("message_id")
+            option_ids = data.get("option_ids") or []
+            if msg_id and option_ids:
+                poll_info = await self._record_poll_vote(
+                    self.scope["user"].id, self.conversation_id, msg_id, option_ids
+                )
+                if poll_info:
+                    await self.channel_layer.group_send(
+                        self.room_group_name,
+                        {
+                            "type": "poll_updated",
+                            **poll_info,
+                        },
+                    )
 
     async def chat_message(self, event):
         await self.send(
@@ -298,6 +313,66 @@ class ChatConsumer(AsyncWebsocketConsumer):
                     "pop_type": event.get("pop_type", "confetti"),
                     "effect": event.get("effect", "burst"),
                     "sound": event.get("sound", "pop"),
+                },
+                cls=DjangoJSONEncoder,
+            )
+        )
+
+    async def poll_updated(self, event):
+        await self.send(
+            text_data=json.dumps(
+                {
+                    "type": "poll_updated",
+                    "message_id": event.get("message_id"),
+                    "chat_id": event.get("chat_id"),
+                    "poll": event.get("poll"),
+                    "voted_by": event.get("voted_by"),
+                    "voted_by_name": event.get("voted_by_name", ""),
+                },
+                cls=DjangoJSONEncoder,
+            )
+        )
+
+    async def poll_closed(self, event):
+        await self.send(
+            text_data=json.dumps(
+                {
+                    "type": "poll_closed",
+                    "message_id": event.get("message_id"),
+                    "chat_id": event.get("chat_id"),
+                    "closed_by": event.get("closed_by"),
+                    "poll": event.get("poll"),
+                },
+                cls=DjangoJSONEncoder,
+            )
+        )
+
+    async def capsule_unlocked(self, event):
+        await self.send(
+            text_data=json.dumps(
+                {
+                    "type": "capsule_unlocked",
+                    "message_id": event.get("message_id"),
+                    "chat_id": event.get("chat_id"),
+                    "message": event.get("message"),
+                    "capsule_type": event.get("capsule_type", "time_capsule"),
+                    "title": event.get("title", ""),
+                },
+                cls=DjangoJSONEncoder,
+            )
+        )
+
+    async def capsule_opened(self, event):
+        await self.send(
+            text_data=json.dumps(
+                {
+                    "type": "capsule_opened",
+                    "message_id": event.get("message_id"),
+                    "chat_id": event.get("chat_id"),
+                    "opened_by": event.get("opened_by"),
+                    "opened_by_name": event.get("opened_by_name", ""),
+                    "capsule_type": event.get("capsule_type", "time_capsule"),
+                    "reveal_style": event.get("reveal_style", "animated"),
                 },
                 cls=DjangoJSONEncoder,
             )
@@ -427,29 +502,58 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 message_type="location",
                 status="sent",
             )
-        elif att_type in ("time_capsule", "capsule"):
-            from datetime import datetime
+        elif att_type in ("time_capsule", "capsule", "secret_letter", "letter"):
+            from datetime import datetime, timedelta
+            preset = att_payload.get("unlock_preset") or "custom"
             unlock_str = att_payload.get("unlock_at")
-            unlock_at = timezone.now()
-            if unlock_str:
+            now = timezone.now()
+
+            if preset == "tomorrow":
+                unlock_at = now + timedelta(days=1)
+            elif preset == "one_week":
+                unlock_at = now + timedelta(days=7)
+            elif preset == "one_month":
+                unlock_at = now + timedelta(days=30)
+            elif unlock_str:
                 try:
                     unlock_at = datetime.fromisoformat(unlock_str.replace("Z", "+00:00"))
                     if timezone.is_naive(unlock_at):
                         unlock_at = timezone.make_aware(unlock_at)
                 except Exception:
-                    pass
+                    unlock_at = now + timedelta(days=1)
+            else:
+                unlock_at = now + timedelta(days=1)
+
+            capsule_type = "secret_letter" if att_type in ("secret_letter", "letter") else att_payload.get("capsule_type", "time_capsule")
+            if att_payload.get("capsule_type") in ("secret_letter", "letter"):
+                capsule_type = "secret_letter"
+
+            passcode = (att_payload.get("passcode") or "").strip()
+            secret_note = att_payload.get("content") or att_payload.get("note") or att_payload.get("secret_content") or ""
+
             msg = Message.objects.create(
                 conversation_id=conversation_id,
                 sender_id=user_id,
                 content=json.dumps({
                     "attachment_type": "time_capsule",
-                    "title": att_payload.get("title", "Time Capsule"),
-                    "secret_content": att_payload.get("content", ""),
+                    "capsule_type": capsule_type,
+                    "title": att_payload.get("title") or ("Secret Letter" if capsule_type == "secret_letter" else "Time Capsule"),
+                    "occasion": att_payload.get("occasion", "secret"),
+                    "secret_content": secret_note,
+                    "note": secret_note,
+                    "memories": att_payload.get("memories", []),
+                    "unlock_preset": preset,
+                    "reveal_style": att_payload.get("reveal_style", "animated"),
+                    "letter_theme": att_payload.get("letter_theme", "classic"),
+                    "passcode": passcode,
+                    "has_passcode": bool(passcode),
+                    "passcode_hint": att_payload.get("passcode_hint", ""),
                     "lock_hint": att_payload.get("lock_hint", ""),
                     "theme": att_payload.get("theme", "golden"),
                     "unlock_at": unlock_at.isoformat(),
-                    "sealed_at": timezone.now().isoformat(),
+                    "sealed_at": now.isoformat(),
                     "is_unlocked": False,
+                    "is_opened": False,
                 }),
                 message_type="capsule",
                 scheduled_for=unlock_at,
@@ -472,6 +576,75 @@ class ChatConsumer(AsyncWebsocketConsumer):
                     "created_at": timezone.now().isoformat(),
                 }),
                 message_type="exi_pop",
+                status="sent",
+            )
+        elif att_type in ("poll", "polls"):
+            import uuid
+            options_list = []
+            raw_options = att_payload.get("options", [])
+            for idx, opt_text in enumerate(raw_options, start=1):
+                options_list.append({
+                    "id": f"opt-{idx}-{uuid.uuid4().hex[:6]}",
+                    "text": str(opt_text),
+                    "voter_ids": [],
+                })
+            expires_at = att_payload.get("expires_at")
+            msg = Message.objects.create(
+                conversation_id=conversation_id,
+                sender_id=user_id,
+                content=json.dumps({
+                    "attachment_type": "poll",
+                    "question": att_payload.get("question", "Poll"),
+                    "options": options_list,
+                    "allow_multiple_answers": bool(att_payload.get("allow_multiple_answers", False)),
+                    "is_anonymous": bool(att_payload.get("is_anonymous", False)),
+                    "is_closed": False,
+                    "expires_at": expires_at,
+                    "created_at": timezone.now().isoformat(),
+                    "created_by": user_id,
+                }),
+                message_type="poll",
+                status="sent",
+            )
+        elif att_type in ("business", "business_card"):
+            biz_id = att_payload.get("business_id")
+            from accounts.user_preferences import get_section_preferences, update_section_preferences
+            from django.contrib.auth import get_user_model
+            User = get_user_model()
+            biz_user = User.objects.filter(id=biz_id).first() if biz_id else None
+            biz_prefs = {}
+            if biz_user:
+                biz_prefs = get_section_preferences(biz_user.id, "business") or {}
+                biz_prefs["recommendation_count"] = biz_prefs.get("recommendation_count", 0) + 1
+                update_section_preferences(biz_user.id, "business", biz_prefs)
+
+            share_ident = (biz_user.exi_id if biz_user else None) or att_payload.get("business_exi_id") or str(biz_user.id if biz_user else biz_id or "")
+            note_str = att_payload.get("personal_message") or att_payload.get("note", "")
+
+            msg = Message.objects.create(
+                conversation_id=conversation_id,
+                sender_id=user_id,
+                content=json.dumps({
+                    "attachment_type": "business",
+                    "business_id": biz_id,
+                    "business_exi_id": biz_user.exi_id if biz_user else att_payload.get("business_exi_id", ""),
+                    "business_name": (biz_user.business_name if biz_user else None) or att_payload.get("business_name", "Business"),
+                    "category": att_payload.get("category", "General"),
+                    "address": (biz_user.business_address if biz_user else None) or att_payload.get("address", ""),
+                    "website": (biz_user.business_website if biz_user else None) or att_payload.get("website", ""),
+                    "note": note_str,
+                    "personal_message": note_str,
+                    "share_url": f"https://exi.chat/biz/{share_ident}" if share_ident else "",
+                    "profile_url": f"/api/business/{share_ident}/public/" if share_ident else "",
+                    "enquiry_url": f"/api/business/{share_ident}/enquire/" if share_ident else "",
+                    "can_chat": True,
+                    "can_enquire": True,
+                    "recommended_by_id": user_id,
+                    "rating": biz_prefs.get("rating", 4.9),
+                    "is_verified": biz_prefs.get("verified", True),
+                    "created_at": timezone.now().isoformat(),
+                }),
+                message_type="business",
                 status="sent",
             )
         else:
@@ -513,6 +686,46 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 "pop_type": data.get("pop_type", "confetti"),
                 "effect": data.get("effect", "burst"),
                 "sound": data.get("sound", "pop"),
+            }
+        except Exception:
+            return None
+
+    @sync_to_async
+    def _record_poll_vote(self, user_id, conversation_id, message_id, option_ids):
+        import json
+        from django.contrib.auth import get_user_model
+        from .models import Message
+        from .serializers import MessageSerializer
+
+        try:
+            msg = Message.objects.get(id=message_id, conversation_id=conversation_id, message_type="poll")
+            data = json.loads(msg.content)
+            if data.get("is_closed"):
+                return None
+            options = data.get("options", [])
+            allow_multi = data.get("allow_multiple_answers", False)
+            selected_set = set(option_ids)
+            for opt in options:
+                voters = opt.setdefault("voter_ids", [])
+                if opt["id"] in selected_set:
+                    if user_id not in voters:
+                        voters.append(user_id)
+                else:
+                    if not allow_multi and user_id in voters:
+                        voters.remove(user_id)
+            msg.content = json.dumps(data)
+            msg.save(update_fields=["content"])
+
+            User = get_user_model()
+            u = User.objects.filter(id=user_id).first()
+            name = getattr(u, "display_name", None) or getattr(u, "username", "User")
+            msg_ser = MessageSerializer(msg)
+            return {
+                "message_id": str(msg.id),
+                "chat_id": str(conversation_id),
+                "poll": msg_ser.data.get("attachment_data") or {},
+                "voted_by": user_id,
+                "voted_by_name": name,
             }
         except Exception:
             return None

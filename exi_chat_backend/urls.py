@@ -3,6 +3,7 @@ from django.conf.urls.static import static
 from django.contrib import admin
 from django.http import JsonResponse
 from django.urls import include, path
+from accounts.views import PublicBusinessProfileView
 
 
 def api_root(request):
@@ -19,6 +20,7 @@ def api_root(request):
 urlpatterns = [
     path("", api_root),
     path("admin/", admin.site.urls),
+    path("biz/<str:business_identifier>/", PublicBusinessProfileView.as_view()),
     path("api/", include("accounts.urls")),
     path("api/", include("chats.urls")),
 ]

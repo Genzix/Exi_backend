@@ -26,7 +26,10 @@ from .serializers import (
     ContactAttachmentSerializer,
     LocationAttachmentSerializer,
     TimeCapsuleAttachmentSerializer,
+    LETTER_THEME_CONFIG,
     ExiPopAttachmentSerializer,
+    PollCreateSerializer,
+    PollVoteSerializer,
     UnifiedAttachmentSerializer,
 )
 from .utils import broadcast_chat_message, broadcast_message_status
@@ -135,7 +138,8 @@ class SearchChatsView(generics.ListAPIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        return search_chats_queryset(self.request.user, get_query_param(self.request))
+        f = self.request.query_params.get("filter") or self.request.query_params.get("type") or "all"
+        return search_chats_queryset(self.request.user, get_query_param(self.request), filter_type=f)
 
 
 # 3. /api/chats/users/search/  (legacy — use /api/search/users/)
@@ -761,11 +765,22 @@ class ChatPermissionsView(APIView):
                 first_name = (getattr(other, "first_name", "") or "").strip()
                 name = first_name or (getattr(other, "display_name", "") or other.username)
                 banner_text = f"{name} can"
+                from accounts.utils import visible_profile_fields
+                vis = visible_profile_fields(other, request.user)
+                photo_url = None
+                if getattr(other, "profile_photo", None) and vis.get("profile_photo", True):
+                    try:
+                        photo_url = request.build_absolute_uri(other.profile_photo.url)
+                    except Exception:
+                        pass
                 other_user = {
                     "id": other.id,
                     "first_name": first_name,
                     "display_name": getattr(other, "display_name", other.username),
                     "username": other.username,
+                    "profile_photo": photo_url,
+                    "is_online": other.is_online if vis.get("online_status", True) else None,
+                    "last_seen": other.last_seen.isoformat() if other.last_seen and vis.get("last_seen", True) else None,
                     "banner_text": banner_text,
                 }
 
@@ -999,12 +1014,48 @@ class ChatAttachmentMenuView(APIView):
             },
             {
                 "id": "time_capsule",
-                "title": "Time Capsule",
-                "description": "Schedule a locked message to open on a future date",
+                "path": "Path A: Time Capsule",
+                "title": "Time Capsule & Secret Letter",
+                "description": "Schedule a locked message or secret letter with future reveal & passcode protection",
                 "icon": "time_capsule",
                 "category": "interactive",
                 "is_enabled": messages_allowed,
+                "supported_types": ["time_capsule", "secret_letter"],
+                "occasions": ["birthday", "future_you", "milestone", "secret"],
+                "unlock_presets": ["tomorrow", "one_week", "one_month", "custom"],
+                "reveal_styles": ["animated", "classic"],
+                "letter_themes": ["classic", "love", "birthday", "modern"],
+                "supports_passcode": True,
+                "supports_memories": True,
+                "action_button": "Seal & Deliver",
+                "preview_endpoint": f"/api/chats/{chat_id}/attachments/time-capsule/preview/",
                 "action_endpoint": f"/api/chats/{chat_id}/attachments/time-capsule/",
+                "seal_endpoint": f"/api/chats/{chat_id}/attachments/time-capsule/seal/",
+            },
+            {
+                "id": "secret_letter",
+                "path": "Path B: Secret Letter",
+                "title": "Secret Letter",
+                "description": "Send a passcode-protected sealed letter with themed stationery and future reveal",
+                "icon": "mail",
+                "category": "interactive",
+                "is_enabled": messages_allowed,
+                "supported_types": ["secret_letter", "letter"],
+                "letter_themes": ["classic", "love", "birthday", "modern"],
+                "letter_theme_options": [
+                    {"id": "classic", "name": "Classic Parchment", "paper_texture": "parchment", "seal_color": "#C59B27", "font_family": "serif"},
+                    {"id": "love", "name": "Love Letter", "paper_texture": "rose_linen", "seal_color": "#D90429", "font_family": "cursive"},
+                    {"id": "birthday", "name": "Birthday Letter", "paper_texture": "confetti_ivory", "seal_color": "#7209B7", "font_family": "decorative"},
+                    {"id": "modern", "name": "Modern Minimalist", "paper_texture": "matte_smooth", "seal_color": "#495057", "font_family": "sans-serif"},
+                ],
+                "occasions": ["birthday", "future_you", "milestone", "secret"],
+                "unlock_presets": ["tomorrow", "one_week", "one_month", "custom"],
+                "supports_passcode": True,
+                "supports_memories": True,
+                "action_button": "Seal & Send Letter",
+                "preview_endpoint": f"/api/chats/{chat_id}/attachments/secret-letter/preview/",
+                "action_endpoint": f"/api/chats/{chat_id}/attachments/secret-letter/",
+                "seal_endpoint": f"/api/chats/{chat_id}/attachments/secret-letter/seal/",
             },
             {
                 "id": "exi_pop",
@@ -1016,12 +1067,31 @@ class ChatAttachmentMenuView(APIView):
                 "pop_types": ["confetti", "buzz", "scratch_card", "flash", "fireworks", "heartbeat", "gift_box"],
                 "action_endpoint": f"/api/chats/{chat_id}/attachments/exi-pop/",
             },
+            {
+                "id": "poll",
+                "title": "Poll",
+                "description": "Create a group poll with multiple choices and live votes",
+                "icon": "poll",
+                "category": "interactive",
+                "is_enabled": messages_allowed,
+                "action_endpoint": f"/api/chats/{chat_id}/polls/",
+            },
+            {
+                "id": "business",
+                "title": "Business",
+                "description": "Share and recommend a business card to this chat",
+                "icon": "storefront",
+                "category": "structured",
+                "is_enabled": messages_allowed,
+                "action_endpoint": f"/api/chats/{chat_id}/attachments/business/",
+            },
         ]
 
         return Response({
             "chat_id": str(chat_id),
             "conversation_type": participant.conversation.type,
             "attachment_menu": menu_items,
+            "menu": menu_items,
             "permissions": perms_display,
         })
 
@@ -1064,13 +1134,17 @@ class ChatAttachmentSendView(APIView):
                 att_type = "time_capsule"
             elif "pop_type" in request.data or "exi_pop" in request.data:
                 att_type = "exi_pop"
+            elif "question" in request.data or "options" in request.data or "poll" in request.data:
+                att_type = "poll"
+            elif "business_id" in request.data or "business_exi_id" in request.data or "business_name" in request.data or "business" in request.data:
+                att_type = "business"
             elif "file" in request.FILES or "file" in request.data:
                 uploaded = request.FILES.get("file") or request.data.get("file")
                 mime = (getattr(uploaded, "content_type", "") or "").lower()
                 att_type = "documents" if mime.startswith(("application/", "text/")) else "photos"
             else:
                 return Response(
-                    {"detail": "attachment_type is required: camera, photos, documents, contacts, location, time_capsule, or exi_pop."},
+                    {"detail": "attachment_type is required: camera, photos, documents, contacts, location, time_capsule, exi_pop, poll, or business."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
@@ -1189,30 +1263,49 @@ class ChatAttachmentSendView(APIView):
                 status="sent",
             )
 
-        # 4. Time Capsule
-        elif att_type in ("time_capsule", "capsule"):
+        # 4. Time Capsule & Secret Letter
+        elif att_type in ("time_capsule", "capsule", "secret_letter", "letter"):
             msg_allowed, msg_err = check_chat_message_permission(chat_id, request.user.id)
             if not msg_allowed:
                 return Response({"detail": msg_err}, status=status.HTTP_403_FORBIDDEN)
 
-            raw_tc = request.data.get("time_capsule") or request.data
+            raw_tc = request.data.get("time_capsule") or request.data.get("secret_letter") or request.data
             ser = TimeCapsuleAttachmentSerializer(data=raw_tc)
             ser.is_valid(raise_exception=True)
             tc_data = ser.validated_data
 
             unlock_at = tc_data["unlock_at"]
+            capsule_type = "secret_letter" if att_type in ("secret_letter", "letter") else tc_data.get("capsule_type", "time_capsule")
+            if tc_data.get("capsule_type") in ("secret_letter", "letter"):
+                capsule_type = "secret_letter"
+
+            passcode = (tc_data.get("passcode") or "").strip()
+            secret_note = tc_data.get("content") or tc_data.get("note") or tc_data.get("secret_content") or ""
+
             msg = Message.objects.create(
                 conversation_id=chat_id,
                 sender=request.user,
                 content=json.dumps({
                     "attachment_type": "time_capsule",
-                    "title": tc_data.get("title") or "Time Capsule",
-                    "secret_content": tc_data["content"],
+                    "capsule_type": capsule_type,
+                    "title": tc_data.get("title") or ("Secret Letter" if capsule_type == "secret_letter" else "Time Capsule"),
+                    "occasion": tc_data.get("occasion", "secret"),
+                    "secret_content": secret_note,
+                    "note": secret_note,
+                    "memories": tc_data.get("memories", []),
+                    "unlock_preset": tc_data.get("unlock_preset", "custom"),
+                    "reveal_style": tc_data.get("reveal_style", "animated"),
+                    "letter_theme": tc_data.get("letter_theme", "classic"),
+                    "theme_details": LETTER_THEME_CONFIG.get(tc_data.get("letter_theme", "classic"), LETTER_THEME_CONFIG["classic"]) if capsule_type == "secret_letter" else None,
+                    "passcode": passcode,
+                    "has_passcode": bool(passcode),
+                    "passcode_hint": tc_data.get("passcode_hint", ""),
                     "lock_hint": tc_data.get("lock_hint", ""),
                     "theme": tc_data.get("theme", "golden"),
                     "unlock_at": unlock_at.isoformat(),
                     "sealed_at": timezone.now().isoformat(),
                     "is_unlocked": False,
+                    "is_opened": False,
                 }),
                 message_type="capsule",
                 scheduled_for=unlock_at,
@@ -1249,9 +1342,129 @@ class ChatAttachmentSendView(APIView):
                 status="sent",
             )
 
+        # 6. Group Chat Poll
+        elif att_type in ("poll", "polls"):
+            msg_allowed, msg_err = check_chat_message_permission(chat_id, request.user.id)
+            if not msg_allowed:
+                return Response({"detail": msg_err}, status=status.HTTP_403_FORBIDDEN)
+
+            raw_poll = request.data.get("poll") or request.data
+            ser = PollCreateSerializer(data=raw_poll)
+            ser.is_valid(raise_exception=True)
+            pdata = ser.validated_data
+
+            import uuid
+            options_list = []
+            for idx, opt_text in enumerate(pdata["options"], start=1):
+                options_list.append({
+                    "id": f"opt-{idx}-{uuid.uuid4().hex[:6]}",
+                    "text": opt_text,
+                    "voter_ids": [],
+                })
+
+            expires_at = pdata.get("expires_at")
+            poll_content = {
+                "attachment_type": "poll",
+                "question": pdata["question"],
+                "options": options_list,
+                "allow_multiple_answers": pdata.get("allow_multiple_answers", False),
+                "is_anonymous": pdata.get("is_anonymous", False),
+                "is_closed": False,
+                "expires_at": expires_at.isoformat() if expires_at else None,
+                "created_at": timezone.now().isoformat(),
+                "created_by": request.user.id,
+            }
+
+            msg = Message.objects.create(
+                conversation_id=chat_id,
+                sender=request.user,
+                content=json.dumps(poll_content),
+                message_type="poll",
+                status="sent",
+            )
+
+        # 7. Business Card / Recommendation
+        elif att_type in ("business", "business_card"):
+            msg_allowed, msg_err = check_chat_message_permission(chat_id, request.user.id)
+            if not msg_allowed:
+                return Response({"detail": msg_err}, status=status.HTTP_403_FORBIDDEN)
+
+            raw_b = request.data.get("business") or request.data
+            biz_id = raw_b.get("business_id")
+            biz_exi_id = raw_b.get("business_exi_id")
+
+            biz_user = None
+            if biz_id:
+                biz_user = User.objects.filter(id=biz_id).first()
+            if not biz_user and biz_exi_id:
+                biz_user = User.objects.filter(exi_id=biz_exi_id).first()
+
+            from accounts.user_preferences import get_section_preferences, update_section_preferences
+            biz_prefs = {}
+            if biz_user:
+                biz_prefs = get_section_preferences(biz_user.id, "business") or {}
+                biz_prefs["recommendation_count"] = biz_prefs.get("recommendation_count", 0) + 1
+                update_section_preferences(biz_user.id, "business", biz_prefs)
+
+            biz_name = (biz_user.business_name if biz_user and biz_user.business_name else None) or raw_b.get("business_name") or (biz_user.username if biz_user else "Business")
+            biz_addr = (biz_user.business_address if biz_user else None) or raw_b.get("address", "")
+            biz_web = (biz_user.business_website if biz_user else None) or raw_b.get("website", "")
+            categories = biz_prefs.get("categories", []) or ([raw_b.get("category")] if raw_b.get("category") else ["General"])
+
+            avatar_url = raw_b.get("avatar_url", "")
+            if not avatar_url and biz_user and getattr(biz_user, "profile_photo", None):
+                try:
+                    avatar_url = request.build_absolute_uri(biz_user.profile_photo.url)
+                except Exception:
+                    pass
+
+            share_ident = (biz_user.exi_id if biz_user else None) or biz_exi_id or str(biz_user.id if biz_user else biz_id)
+            share_url = request.build_absolute_uri(f"/biz/{share_ident}")
+            profile_url = f"/api/business/{share_ident}/public/"
+            enquiry_url = f"/api/business/{share_ident}/enquire/"
+            note_text = (raw_b.get("personal_message") or raw_b.get("note") or "").strip()
+
+            b_card = {
+                "attachment_type": "business",
+                "business_id": biz_user.id if biz_user else biz_id,
+                "business_exi_id": biz_user.exi_id if biz_user else biz_exi_id,
+                "business_name": biz_name,
+                "display_name": (biz_user.display_name if biz_user else None) or biz_name,
+                "category": categories[0] if categories else "General",
+                "categories": categories,
+                "address": biz_addr,
+                "website": biz_web,
+                "bio": biz_user.bio if biz_user else "",
+                "rating": biz_prefs.get("rating", 4.9),
+                "review_count": biz_prefs.get("review_count", 0),
+                "recommendation_count": biz_prefs.get("recommendation_count", 1),
+                "is_verified": biz_prefs.get("verified", True),
+                "avatar_url": avatar_url,
+                "note": note_text,
+                "personal_message": note_text,
+                "share_url": share_url,
+                "profile_url": profile_url,
+                "enquiry_url": enquiry_url,
+                "recommended_by_id": request.user.id,
+                "recommended_by_name": getattr(request.user, "display_name", None) or request.user.username,
+                "recommended_at": timezone.now().isoformat(),
+                "can_chat": True,
+                "can_enquire": True,
+                "can_view_catalog": len(biz_prefs.get("products", [])) > 0,
+                "products_preview": biz_prefs.get("products", [])[:3],
+            }
+
+            msg = Message.objects.create(
+                conversation_id=chat_id,
+                sender=request.user,
+                content=json.dumps(b_card),
+                message_type="business",
+                status="sent",
+            )
+
         else:
             return Response(
-                {"detail": f"Unknown attachment type '{att_type}'. Supported: camera, photos, documents, contacts, location, time_capsule, exi_pop."},
+                {"detail": f"Unknown attachment type '{att_type}'. Supported: camera, photos, documents, contacts, location, time_capsule, exi_pop, poll, business."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -1298,16 +1511,133 @@ class ChatLocationAttachmentView(APIView):
         return ChatAttachmentSendView().post(request, chat_id)
 
 
+class ChatTimeCapsulePreviewView(APIView):
+    """
+    POST /api/chats/<chat_id>/attachments/time-capsule/preview/
+    POST /api/chats/<chat_id>/attachments/secret-letter/preview/
+    POST /api/chats/<chat_id>/time-capsule/preview/
+
+    Step 4 (Path A) & Step 5 (Path B): Preview the capsule or secret letter.
+    Validates input without saving to database, returns simulated sender preview,
+    recipient preview (sealed/redacted), countdown, theme styling, and seal endpoint.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, chat_id):
+        from .chat_permissions import check_chat_message_permission
+
+        try:
+            participant = ConversationParticipant.objects.select_related("conversation").get(
+                user=request.user, conversation_id=chat_id, deleted_at__isnull=True
+            )
+        except ConversationParticipant.DoesNotExist:
+            return Response({"detail": "Not a participant."}, status=status.HTTP_403_FORBIDDEN)
+
+        msg_allowed, msg_err = check_chat_message_permission(chat_id, request.user.id)
+        if not msg_allowed:
+            return Response({"detail": msg_err}, status=status.HTTP_403_FORBIDDEN)
+
+        data = dict(request.data)
+        path = request.path.lower()
+        if "secret-letter" in path or data.get("capsule_type") in ("secret_letter", "letter"):
+            data.setdefault("capsule_type", "secret_letter")
+
+        ser = TimeCapsuleAttachmentSerializer(data=data)
+        ser.is_valid(raise_exception=True)
+        vdata = ser.validated_data
+
+        now = timezone.now()
+        unlock_at = vdata["unlock_at"]
+        countdown_seconds = max(0, int((unlock_at - now).total_seconds()))
+        capsule_type = vdata.get("capsule_type", "time_capsule")
+
+        passcode = (vdata.get("passcode") or "").strip()
+        has_passcode = bool(passcode)
+        letter_theme = vdata.get("letter_theme", "classic")
+        theme_details = LETTER_THEME_CONFIG.get(letter_theme, LETTER_THEME_CONFIG["classic"])
+        reveal_style = vdata.get("reveal_style", "animated")
+        secret_note = vdata.get("content") or vdata.get("note") or ""
+        memories = vdata.get("memories", [])
+        occasion = vdata.get("occasion", "secret")
+
+        action_title = "Seal & Deliver" if capsule_type == "time_capsule" else "Seal & Send Letter"
+        path_name = "Path B: Secret Letter" if capsule_type == "secret_letter" else "Path A: Time Capsule"
+        seal_slug = "secret-letter" if capsule_type == "secret_letter" else "time-capsule"
+
+        sender_preview = {
+            "title": vdata.get("title") or ("Secret Letter" if capsule_type == "secret_letter" else "Time Capsule"),
+            "capsule_type": capsule_type,
+            "occasion": occasion,
+            "unlock_at": unlock_at.isoformat(),
+            "countdown_seconds": countdown_seconds,
+            "note": secret_note,
+            "memories": memories,
+            "reveal_style": reveal_style,
+            "letter_theme": letter_theme,
+            "has_passcode": has_passcode,
+            "passcode_hint": vdata.get("passcode_hint", ""),
+            "theme_details": theme_details if capsule_type == "secret_letter" else None,
+            "is_sealed": False,
+            "status": "preview",
+        }
+
+        recipient_preview = {
+            "title": sender_preview["title"],
+            "capsule_type": capsule_type,
+            "occasion": occasion,
+            "unlock_at": unlock_at.isoformat(),
+            "countdown_seconds": countdown_seconds,
+            "note": None,
+            "memories": [],
+            "memories_count": len(memories),
+            "reveal_style": reveal_style,
+            "letter_theme": letter_theme,
+            "has_passcode": has_passcode,
+            "passcode_hint": vdata.get("passcode_hint", "") if has_passcode else "",
+            "theme_details": theme_details if capsule_type == "secret_letter" else None,
+            "is_sealed": True,
+            "status": "sealed_preview",
+            "message": f"Sealed! Unlocks in {countdown_seconds} seconds." if countdown_seconds > 0 else "Ready to unlock!",
+        }
+
+        return Response({
+            "chat_id": str(chat_id),
+            "capsule_type": capsule_type,
+            "path": path_name,
+            "action_button": action_title,
+            "seal_endpoint": f"/api/chats/{chat_id}/attachments/{seal_slug}/",
+            "seal_action_endpoint": f"/api/chats/{chat_id}/attachments/{seal_slug}/seal/",
+            "sender_preview": sender_preview,
+            "recipient_preview": recipient_preview,
+            "theme_details": theme_details if capsule_type == "secret_letter" else None,
+            "unlock_summary": {
+                "preset": vdata.get("unlock_preset", "custom"),
+                "unlock_at": unlock_at.isoformat(),
+                "countdown_seconds": countdown_seconds,
+            },
+        }, status=status.HTTP_200_OK)
+
+
 class ChatTimeCapsuleAttachmentView(APIView):
     """
     POST /api/chats/<chat_id>/attachments/time-capsule/
-    Dedicated endpoint for scheduling and sealing a Time Capsule.
+    POST /api/chats/<chat_id>/attachments/time-capsule/seal/
+    POST /api/chats/<chat_id>/attachments/secret-letter/
+    POST /api/chats/<chat_id>/attachments/secret-letter/seal/
+    POST /api/chats/<chat_id>/time-capsule/
+    POST /api/chats/<chat_id>/time-capsule/seal/
+    Dedicated endpoint for sealing & delivering a Time Capsule (Path A Step 5)
+    or sealing & sending a Secret Letter (Path B Step 6).
     """
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, chat_id):
         data = dict(request.data)
-        data["attachment_type"] = "time_capsule"
+        ctype = data.get("capsule_type") or data.get("type") or ""
+        if ctype in ("secret_letter", "letter") or "secret-letter" in request.path:
+            data["attachment_type"] = "secret_letter"
+        else:
+            data["attachment_type"] = "time_capsule"
         request._full_data = data
         return ChatAttachmentSendView().post(request, chat_id)
 
@@ -1315,7 +1645,9 @@ class ChatTimeCapsuleAttachmentView(APIView):
 class ChatTimeCapsuleDetailView(APIView):
     """
     GET /api/chats/<chat_id>/attachments/time-capsule/<message_id>/
-    Inspect a Time Capsule: reveals secret content once unlock_at is reached.
+    GET /api/chats/<chat_id>/time-capsule/<message_id>/
+    Inspect a Time Capsule or Secret Letter: reveals secret content once unlock_at is reached
+    and passcode (when required) is verified.
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -1340,30 +1672,172 @@ class ChatTimeCapsuleDetailView(APIView):
 
         now = timezone.now()
         is_sender = request.user.id == msg.sender_id
-        is_unlocked = msg.scheduled_for and now >= msg.scheduled_for
+        is_unlocked = bool(data.get("is_unlocked")) or (msg.scheduled_for and now >= msg.scheduled_for)
 
         time_left_seconds = 0
         if msg.scheduled_for and msg.scheduled_for > now:
             time_left_seconds = int((msg.scheduled_for - now).total_seconds())
 
+        has_passcode = bool(data.get("passcode") or data.get("has_passcode"))
+        is_opened = bool(data.get("is_opened", False))
+        is_passcode_required = has_passcode and not is_opened and not is_sender
+
         response_data = {
             "message_id": str(msg.id),
             "sender_id": msg.sender_id,
+            "capsule_type": data.get("capsule_type", "time_capsule"),
             "title": data.get("title", "Time Capsule"),
+            "occasion": data.get("occasion", "secret"),
+            "reveal_style": data.get("reveal_style", "animated"),
+            "letter_theme": data.get("letter_theme", "classic"),
             "lock_hint": data.get("lock_hint", ""),
+            "passcode_hint": data.get("passcode_hint", ""),
             "theme": data.get("theme", "golden"),
             "unlock_at": msg.scheduled_for.isoformat() if msg.scheduled_for else None,
             "is_unlocked": is_unlocked,
             "countdown_seconds": time_left_seconds,
+            "has_passcode": has_passcode,
+            "is_passcode_required": is_passcode_required,
+            "is_opened": is_opened,
+            "memories_count": len(data.get("memories") or []),
+            "open_endpoint": f"/api/chats/{chat_id}/attachments/time-capsule/{msg.id}/open/",
         }
 
-        if is_unlocked or is_sender:
-            response_data["secret_content"] = data.get("secret_content") or data.get("content") or msg.content
+        if (is_unlocked and not is_passcode_required) or is_sender:
+            secret_note = data.get("secret_content") or data.get("content") or data.get("note") or msg.content
+            response_data["secret_content"] = secret_note
+            response_data["note"] = secret_note
+            response_data["memories"] = data.get("memories", [])
         else:
             response_data["secret_content"] = None
-            response_data["message"] = f"Sealed! Unlocks in {time_left_seconds} seconds."
+            response_data["note"] = None
+            response_data["memories"] = []
+            if not is_unlocked:
+                response_data["message"] = f"Sealed! Unlocks in {time_left_seconds} seconds."
+            else:
+                response_data["message"] = "Unlocked! Passcode required to reveal note and memories."
 
         return Response(response_data)
+
+
+class ChatTimeCapsuleOpenView(APIView):
+    """
+    POST /api/chats/<chat_id>/attachments/time-capsule/<message_id>/open/
+    POST /api/chats/<chat_id>/time-capsule/<message_id>/open/
+    Step 10: Opens a Time Capsule or Secret Letter.
+    Validates unlock date, validates passcode when required, marks as opened, broadcasts WebSocket event,
+    and returns revealed note and memories.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, chat_id, message_id):
+        import json
+        from asgiref.sync import async_to_sync
+        from channels.layers import get_channel_layer
+
+        try:
+            ConversationParticipant.objects.get(
+                user=request.user, conversation_id=chat_id, deleted_at__isnull=True
+            )
+        except ConversationParticipant.DoesNotExist:
+            return Response({"detail": "Not a participant."}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            msg = Message.objects.get(id=message_id, conversation_id=chat_id, message_type="capsule")
+        except Message.DoesNotExist:
+            return Response({"detail": "Time Capsule message not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        now = timezone.now()
+        is_sender = request.user.id == msg.sender_id
+        is_unlocked = bool(msg.is_scheduled is False and msg.status == 'sent') or (msg.scheduled_for and now >= msg.scheduled_for)
+
+        if not is_unlocked and not is_sender:
+            countdown = int((msg.scheduled_for - now).total_seconds()) if msg.scheduled_for else 0
+            return Response({
+                "detail": f"Time Capsule is still sealed. Unlocks in {countdown} seconds.",
+                "countdown_seconds": countdown,
+                "unlock_at": msg.scheduled_for.isoformat() if msg.scheduled_for else None,
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            data = json.loads(msg.content)
+        except Exception:
+            data = {}
+
+        # Passcode verification
+        expected_passcode = (data.get("passcode") or "").strip()
+        if expected_passcode and not is_sender:
+            provided_passcode = (request.data.get("passcode") or "").strip()
+            if provided_passcode != expected_passcode:
+                return Response({
+                    "detail": "Incorrect passcode.",
+                    "passcode_hint": data.get("passcode_hint", ""),
+                }, status=status.HTTP_401_UNAUTHORIZED)
+
+        # Mark as opened
+        data["is_opened"] = True
+        data["is_unlocked"] = True
+        data["opened_by"] = request.user.id
+        data["opened_at"] = now.isoformat()
+        msg.content = json.dumps(data)
+        msg.save(update_fields=["content"])
+
+        # Broadcast WebSocket event
+        try:
+            channel_layer = get_channel_layer()
+            async_to_sync(channel_layer.group_send)(
+                f"chat_{chat_id}",
+                {
+                    "type": "capsule_opened",
+                    "message_id": str(msg.id),
+                    "chat_id": str(chat_id),
+                    "opened_by": request.user.id,
+                    "opened_by_name": request.user.first_name or request.user.username,
+                    "capsule_type": data.get("capsule_type", "time_capsule"),
+                    "reveal_style": data.get("reveal_style", "animated"),
+                }
+            )
+        except Exception:
+            pass
+
+        secret_note = data.get("secret_content") or data.get("content") or data.get("note") or ""
+        memories = data.get("memories") or []
+
+        return Response({
+            "detail": "Capsule opened successfully.",
+            "message_id": str(msg.id),
+            "capsule_type": data.get("capsule_type", "time_capsule"),
+            "title": data.get("title", ""),
+            "occasion": data.get("occasion", "secret"),
+            "note": secret_note,
+            "secret_content": secret_note,
+            "memories": memories,
+            "reveal_style": data.get("reveal_style", "animated"),
+            "letter_theme": data.get("letter_theme", "classic"),
+            "opened_at": data["opened_at"],
+            "is_opened": True,
+            "is_unlocked": True,
+        }, status=status.HTTP_200_OK)
+
+
+class TimeCapsuleCheckScheduledView(APIView):
+    """
+    POST /api/chats/time-capsules/check-scheduled/
+    Trigger/webhook endpoint to run the Celery background task on demand
+    for checking and delivering due Time Capsules & Secret Letters.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        from chats.tasks import check_and_deliver_time_capsules
+        count = check_and_deliver_time_capsules()
+        return Response({
+            "detail": "Processed scheduled time capsules successfully.",
+            "delivered_count": count or 0,
+        }, status=status.HTTP_200_OK)
+
+    def get(self, request):
+        return self.post(request)
 
 
 class ChatExiPopAttachmentView(APIView):
@@ -1376,6 +1850,20 @@ class ChatExiPopAttachmentView(APIView):
     def post(self, request, chat_id):
         data = dict(request.data)
         data["attachment_type"] = "exi_pop"
+        request._full_data = data
+        return ChatAttachmentSendView().post(request, chat_id)
+
+
+class ChatBusinessAttachmentView(APIView):
+    """
+    POST /api/chats/<chat_id>/attachments/business/
+    Dedicated endpoint for sharing a business recommendation card in chat.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, chat_id):
+        data = dict(request.data)
+        data["attachment_type"] = "business"
         request._full_data = data
         return ChatAttachmentSendView().post(request, chat_id)
 
@@ -1440,6 +1928,254 @@ class ChatExiPopOpenView(APIView):
             "text": data.get("text", ""),
             "is_opened": True,
         })
+
+
+class GroupPollCreateView(APIView):
+    """
+    POST /api/chats/<chat_id>/polls/
+    POST /api/groups/<group_id>/polls/
+    Create a new group poll.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, chat_id=None, group_id=None):
+        target_chat_id = chat_id or group_id
+        data = dict(request.data)
+        data["attachment_type"] = "poll"
+        request._full_data = data
+        return ChatAttachmentSendView().post(request, target_chat_id)
+
+
+class GroupPollDetailView(APIView):
+    """
+    GET /api/chats/<chat_id>/polls/<message_id>/
+    GET /api/groups/<group_id>/polls/<message_id>/
+    Inspect poll options, percentages, live vote counts, and user's voted choices.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, message_id, chat_id=None, group_id=None):
+        target_chat_id = chat_id or group_id
+        try:
+            if target_chat_id:
+                ConversationParticipant.objects.get(
+                    user=request.user, conversation_id=target_chat_id, deleted_at__isnull=True
+                )
+        except ConversationParticipant.DoesNotExist:
+            return Response({"detail": "Not a participant."}, status=status.HTTP_403_FORBIDDEN)
+
+        query = {"id": message_id, "message_type": "poll"}
+        if target_chat_id:
+            query["conversation_id"] = target_chat_id
+
+        try:
+            msg = Message.objects.get(**query)
+        except Message.DoesNotExist:
+            return Response({"detail": "Poll not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if not target_chat_id:
+            if not ConversationParticipant.objects.filter(
+                user=request.user, conversation_id=msg.conversation_id, deleted_at__isnull=True
+            ).exists():
+                return Response({"detail": "Not a participant in this conversation."}, status=status.HTTP_403_FORBIDDEN)
+
+        ser = MessageSerializer(msg, context={"request": request})
+        return Response({
+            "message_id": str(msg.id),
+            "chat_id": str(msg.conversation_id),
+            "sender_id": msg.sender_id,
+            "created_at": msg.created_at.isoformat(),
+            "poll": ser.data.get("attachment_data") or {},
+        })
+
+
+class GroupPollVoteView(APIView):
+    """
+    POST /api/chats/<chat_id>/polls/<message_id>/vote/
+    POST /api/chats/polls/<message_id>/vote/
+    Cast, change, or retract votes on a group poll.
+    Payload: {"option_ids": ["opt-1-xxxx", ...], "retract": false}
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, message_id, chat_id=None, group_id=None):
+        import json
+        from asgiref.sync import async_to_sync
+        from channels.layers import get_channel_layer
+        from django.utils.dateparse import parse_datetime
+
+        target_chat_id = chat_id or group_id
+        query = {"id": message_id, "message_type": "poll"}
+        if target_chat_id:
+            query["conversation_id"] = target_chat_id
+
+        try:
+            msg = Message.objects.get(**query)
+        except Message.DoesNotExist:
+            return Response({"detail": "Poll not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        effective_chat_id = msg.conversation_id
+        if not ConversationParticipant.objects.filter(
+            user=request.user, conversation_id=effective_chat_id, deleted_at__isnull=True
+        ).exists():
+            return Response({"detail": "Not a participant in this chat."}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            pdata = json.loads(msg.content)
+        except Exception:
+            pdata = {}
+
+        now = timezone.now()
+        expires_at_str = pdata.get("expires_at")
+        if expires_at_str:
+            try:
+                exp_dt = parse_datetime(expires_at_str)
+                if exp_dt and now >= exp_dt:
+                    pdata["is_closed"] = True
+                    msg.content = json.dumps(pdata)
+                    msg.save(update_fields=["content"])
+                    return Response({"detail": "This poll has expired and is closed."}, status=status.HTTP_400_BAD_REQUEST)
+            except Exception:
+                pass
+
+        if pdata.get("is_closed"):
+            return Response({"detail": "This poll is closed."}, status=status.HTTP_400_BAD_REQUEST)
+
+        vote_ser = PollVoteSerializer(data=request.data)
+        vote_ser.is_valid(raise_exception=True)
+        selected_ids = list(vote_ser.validated_data["option_ids"])
+
+        allow_multi = pdata.get("allow_multiple_answers", False)
+        options = pdata.get("options", [])
+        valid_option_ids = {opt["id"] for opt in options}
+
+        invalid = set(selected_ids) - valid_option_ids
+        if invalid:
+            return Response({"detail": f"Invalid option IDs: {list(invalid)}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not allow_multi and len(selected_ids) > 1:
+            return Response({"detail": "Multiple answers are not allowed for this poll."}, status=status.HTTP_400_BAD_REQUEST)
+
+        user_id = request.user.id
+        is_retract = request.data.get("retract", False)
+
+        for opt in options:
+            opt_id = opt["id"]
+            voters = opt.setdefault("voter_ids", [])
+            already_voted = user_id in voters
+
+            if opt_id in selected_ids:
+                if is_retract and already_voted:
+                    voters.remove(user_id)
+                elif not already_voted:
+                    voters.append(user_id)
+            else:
+                if not allow_multi and already_voted:
+                    voters.remove(user_id)
+
+        msg.content = json.dumps(pdata)
+        msg.save(update_fields=["content"])
+
+        msg_ser = MessageSerializer(msg, context={"request": request})
+        poll_res = msg_ser.data.get("attachment_data") or {}
+
+        # Broadcast real-time WebSocket event to chat group
+        channel_layer = get_channel_layer()
+        if channel_layer:
+            async_to_sync(channel_layer.group_send)(
+                f"chat_{effective_chat_id}",
+                {
+                    "type": "poll_updated",
+                    "message_id": str(msg.id),
+                    "chat_id": str(effective_chat_id),
+                    "poll": poll_res,
+                    "voted_by": user_id,
+                    "voted_by_name": getattr(request.user, "display_name", None) or request.user.username,
+                }
+            )
+
+        return Response({
+            "detail": "Vote recorded successfully.",
+            "poll": poll_res,
+        }, status=status.HTTP_200_OK)
+
+
+class GroupPollCloseView(APIView):
+    """
+    POST /api/chats/<chat_id>/polls/<message_id>/close/
+    POST /api/chats/polls/<message_id>/close/
+    Close an active poll. Can only be performed by the poll creator or group admin.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, message_id, chat_id=None, group_id=None):
+        import json
+        from asgiref.sync import async_to_sync
+        from channels.layers import get_channel_layer
+
+        target_chat_id = chat_id or group_id
+        query = {"id": message_id, "message_type": "poll"}
+        if target_chat_id:
+            query["conversation_id"] = target_chat_id
+
+        try:
+            msg = Message.objects.get(**query)
+        except Message.DoesNotExist:
+            return Response({"detail": "Poll not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        effective_chat_id = msg.conversation_id
+        try:
+            participant = ConversationParticipant.objects.get(
+                user=request.user, conversation_id=effective_chat_id, deleted_at__isnull=True
+            )
+        except ConversationParticipant.DoesNotExist:
+            return Response({"detail": "Not a participant in this conversation."}, status=status.HTTP_403_FORBIDDEN)
+
+        is_creator = msg.sender_id == request.user.id
+        is_admin = getattr(participant, "role", "") in ("admin", "owner")
+        if not is_creator and not is_admin:
+            return Response({"detail": "Only the poll creator or group admins can close this poll."}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            pdata = json.loads(msg.content)
+        except Exception:
+            pdata = {}
+
+        if pdata.get("is_closed"):
+            msg_ser = MessageSerializer(msg, context={"request": request})
+            return Response({
+                "detail": "Poll is already closed.",
+                "poll": msg_ser.data.get("attachment_data") or {},
+            }, status=status.HTTP_200_OK)
+
+        pdata["is_closed"] = True
+        pdata["closed_at"] = timezone.now().isoformat()
+        pdata["closed_by"] = request.user.id
+
+        msg.content = json.dumps(pdata)
+        msg.save(update_fields=["content"])
+
+        msg_ser = MessageSerializer(msg, context={"request": request})
+        poll_res = msg_ser.data.get("attachment_data") or {}
+
+        # Broadcast closed event
+        channel_layer = get_channel_layer()
+        if channel_layer:
+            async_to_sync(channel_layer.group_send)(
+                f"chat_{effective_chat_id}",
+                {
+                    "type": "poll_closed",
+                    "message_id": str(msg.id),
+                    "chat_id": str(effective_chat_id),
+                    "closed_by": request.user.id,
+                    "poll": poll_res,
+                }
+            )
+
+        return Response({
+            "detail": "Poll closed successfully.",
+            "poll": poll_res,
+        }, status=status.HTTP_200_OK)
 
 
 class ContactCardDetailView(APIView):
@@ -2349,26 +3085,59 @@ def search_users_queryset(user, query):
     )
 
 
-def search_chats_queryset(user, query):
+def search_chats_queryset(user, query="", filter_type="all"):
     queryset = ConversationParticipant.objects.filter(
         user=user,
         deleted_at__isnull=True,
         is_archived=False,
     ).select_related("conversation").order_by("-conversation__updated_at")
 
+    norm_filter = str(filter_type or "all").lower().strip()
+    if norm_filter == "unread":
+        queryset = queryset.filter(unread_count__gt=0)
+    elif norm_filter == "groups":
+        queryset = queryset.filter(conversation__type="group")
+    elif norm_filter in ("photos", "photo", "image", "images"):
+        queryset = queryset.filter(
+            conversation__messages__message_type="image"
+        )
+    elif norm_filter in ("videos", "video"):
+        queryset = queryset.filter(
+            conversation__messages__message_type="video"
+        )
+
     if not query:
+        if norm_filter in ("unread", "groups", "photos", "videos", "photo", "video", "image"):
+            return queryset.distinct()[:SEARCH_LIMIT]
         return queryset.none()
 
-    return queryset.filter(
+    q_filter = (
         models.Q(conversation__participants__display_name__icontains=query)
         | models.Q(conversation__participants__full_name__icontains=query)
+        | models.Q(conversation__participants__username__icontains=query)
         | models.Q(conversation__participants__exi_id__icontains=query)
         | models.Q(conversation__messages__content__icontains=query)
         | models.Q(conversation__messages__attachment_name__icontains=query)
-    ).distinct()[:SEARCH_LIMIT]
+    )
+
+    from .group_views import _get_group_meta
+    matching_group_cids = []
+    user_group_parts = queryset.filter(conversation__type="group").values_list("conversation_id", flat=True)
+    for cid in user_group_parts:
+        meta = _get_group_meta(cid)
+        if meta:
+            g_name = meta.get("name") or ""
+            g_desc = meta.get("description") or ""
+            if query.lower() in g_name.lower() or query.lower() in g_desc.lower():
+                matching_group_cids.append(cid)
+
+    if matching_group_cids:
+        q_filter |= models.Q(conversation_id__in=matching_group_cids)
+
+    return queryset.filter(q_filter).distinct()[:SEARCH_LIMIT]
 
 
-def search_messages_queryset(user, query, chat_id=None):
+def search_messages_queryset(user, query="", filter_type="all", chat_id=None):
     from datetime import timedelta
     now = timezone.now()
 
@@ -2380,7 +3149,12 @@ def search_messages_queryset(user, query, chat_id=None):
     if chat_id:
         participants = participants.filter(conversation_id=chat_id)
 
-    if not participants.exists() or not query:
+    if not participants.exists():
+        return Message.objects.none()
+
+    norm_filter = str(filter_type or "all").lower().strip()
+
+    if not query and norm_filter == "all":
         return Message.objects.none()
 
     q_filter = models.Q()
@@ -2398,15 +3172,201 @@ def search_messages_queryset(user, query, chat_id=None):
             conv_q &= models.Q(created_at__gte=min_created)
         q_filter |= conv_q
 
-    return (
-        Message.objects.filter(q_filter)
-        .filter(
+    type_filter = models.Q()
+    if norm_filter == "unread":
+        type_filter = ~models.Q(sender=user) & ~models.Q(status="read")
+    elif norm_filter == "groups":
+        type_filter = models.Q(conversation__type="group")
+    elif norm_filter in ("photos", "photo", "image", "images"):
+        type_filter = (
+            models.Q(message_type="image")
+            | models.Q(attachment_mime_type__startswith="image/")
+            | models.Q(media__media_type="image")
+        )
+    elif norm_filter in ("videos", "video"):
+        type_filter = (
+            models.Q(message_type="video")
+            | models.Q(attachment_mime_type__startswith="video/")
+            | models.Q(media__media_type="video")
+        )
+    elif norm_filter in ("files", "documents", "document"):
+        type_filter = (
+            models.Q(message_type="document")
+            | models.Q(attachment_mime_type__startswith="application/")
+            | models.Q(attachment_mime_type__startswith="text/")
+            | models.Q(media__media_type="document")
+        )
+
+    qs = Message.objects.filter(q_filter).filter(type_filter)
+
+    if query:
+        qs = qs.filter(
             models.Q(content__icontains=query)
             | models.Q(attachment_name__icontains=query)
+            | models.Q(sender__display_name__icontains=query)
+            | models.Q(sender__username__icontains=query)
         )
-        .select_related("sender", "conversation")
-        .order_by("-created_at")[:MESSAGE_SEARCH_LIMIT]
+
+    return qs.select_related("sender", "conversation").order_by("-created_at")[:MESSAGE_SEARCH_LIMIT]
+
+
+def search_files_queryset(user, query="", filter_type="all", chat_id=None):
+    from datetime import timedelta
+    now = timezone.now()
+
+    participants = ConversationParticipant.objects.filter(
+        user=user,
+        deleted_at__isnull=True,
+    ).select_related("conversation")
+
+    if chat_id:
+        participants = participants.filter(conversation_id=chat_id)
+
+    if not participants.exists():
+        return Message.objects.none()
+
+    q_filter = models.Q()
+    for p in participants:
+        conv_q = models.Q(conversation_id=p.conversation_id)
+        min_created = p.cleared_at
+        if p.conversation.disappearing_duration:
+            expired_threshold = now - timedelta(seconds=p.conversation.disappearing_duration)
+            if min_created:
+                min_created = max(min_created, expired_threshold)
+            else:
+                min_created = expired_threshold
+        if min_created:
+            conv_q &= models.Q(created_at__gte=min_created)
+        q_filter |= conv_q
+
+    media_filter = (
+        (models.Q(attachment__isnull=False) & ~models.Q(attachment=""))
+        | models.Q(attachment_name__gt="")
+        | models.Q(media__isnull=False)
+        | models.Q(message_type__in=["image", "video", "document", "audio", "voice"])
     )
+
+    norm_filter = str(filter_type or "all").lower().strip()
+    if norm_filter in ("photos", "photo", "image", "images"):
+        media_filter &= (
+            models.Q(message_type="image")
+            | models.Q(attachment_mime_type__startswith="image/")
+            | models.Q(media__media_type="image")
+        )
+    elif norm_filter in ("videos", "video"):
+        media_filter &= (
+            models.Q(message_type="video")
+            | models.Q(attachment_mime_type__startswith="video/")
+            | models.Q(media__media_type="video")
+        )
+    elif norm_filter in ("files", "documents", "document"):
+        media_filter &= (
+            models.Q(message_type="document")
+            | models.Q(attachment_mime_type__startswith="application/")
+            | models.Q(attachment_mime_type__startswith="text/")
+            | models.Q(media__media_type="document")
+        )
+
+    if norm_filter == "groups":
+        media_filter &= models.Q(conversation__type="group")
+
+    if norm_filter == "unread":
+        media_filter &= ~models.Q(sender=user) & ~models.Q(status="read")
+
+    qs = Message.objects.filter(q_filter).filter(media_filter)
+
+    if query:
+        qs = qs.filter(
+            models.Q(content__icontains=query)
+            | models.Q(attachment_name__icontains=query)
+            | models.Q(sender__display_name__icontains=query)
+            | models.Q(sender__username__icontains=query)
+            | models.Q(media__file_name__icontains=query)
+        )
+
+    return qs.select_related("sender", "conversation", "media").order_by("-created_at")[:MESSAGE_SEARCH_LIMIT]
+
+
+def serialize_search_file_result(msg, request=None):
+    from django.urls import reverse
+    download_url = None
+    if msg.media_id and getattr(msg, "media", None) and msg.media.status == "ready":
+        try:
+            path = reverse("media-download", kwargs={"media_id": msg.media_id})
+            download_url = request.build_absolute_uri(path) if request else path
+        except Exception:
+            download_url = None
+    elif msg.attachment:
+        try:
+            path = reverse("message-attachment-download", kwargs={"message_id": msg.id})
+            download_url = request.build_absolute_uri(path) if request else path
+        except Exception:
+            try:
+                download_url = request.build_absolute_uri(msg.attachment.url) if request else msg.attachment.url
+            except Exception:
+                download_url = None
+
+    ftype = "file"
+    mime = msg.attachment_mime_type or (msg.media.mime_type if getattr(msg, "media", None) else "") or ""
+    if msg.message_type == "image" or mime.startswith("image/"):
+        ftype = "photo"
+    elif msg.message_type == "video" or mime.startswith("video/"):
+        ftype = "video"
+    elif msg.message_type in ("audio", "voice") or mime.startswith("audio/"):
+        ftype = "audio"
+    elif msg.message_type == "document" or mime.startswith("application/") or mime.startswith("text/"):
+        ftype = "document"
+
+    chat_name = "Chat"
+    if msg.conversation.type == "group":
+        from .group_views import _get_group_meta
+        meta = _get_group_meta(msg.conversation_id)
+        if meta and meta.get("name"):
+            chat_name = meta["name"]
+        else:
+            chat_name = "Group Chat"
+    else:
+        if request and request.user.is_authenticated:
+            other = msg.conversation.participants.exclude(id=request.user.id).first()
+            if other:
+                chat_name = getattr(other, "display_name", "") or other.username
+        else:
+            chat_name = getattr(msg.sender, "display_name", "") or msg.sender.username
+
+    file_name = msg.attachment_name or ""
+    if not file_name and msg.attachment:
+        file_name = os.path.basename(msg.attachment.name)
+    if not file_name and getattr(msg, "media", None):
+        file_name = msg.media.file_name or ""
+    if not file_name:
+        file_name = f"{ftype}_{str(msg.id)[:8]}"
+
+    file_size = msg.attachment_size or 0
+    if not file_size and msg.attachment:
+        try:
+            file_size = msg.attachment.size
+        except Exception:
+            file_size = 0
+
+    return {
+        "id": str(msg.id),
+        "message_id": str(msg.id),
+        "conversation_id": str(msg.conversation_id),
+        "chat_id": str(msg.conversation_id),
+        "chat_name": chat_name,
+        "is_group": msg.conversation.type == "group",
+        "sender_id": msg.sender_id,
+        "sender_name": getattr(msg.sender, "display_name", "") or msg.sender.username,
+        "sender_username": msg.sender.username,
+        "type": ftype,
+        "file_name": file_name,
+        "mime_type": mime,
+        "size": file_size,
+        "url": download_url,
+        "thumbnail_url": download_url if ftype in ("photo", "video") else None,
+        "caption": msg.content or "",
+        "created_at": msg.created_at.isoformat() if msg.created_at else None,
+    }
 
 
 class SearchUsersAPIView(APIView):
@@ -2433,12 +3393,14 @@ class SearchChatsAPIView(APIView):
 
     def get(self, request):
         query = get_query_param(request)
-        chats = list(search_chats_queryset(request.user, query))
+        f = request.query_params.get("filter") or request.query_params.get("type") or "all"
+        chats = list(search_chats_queryset(request.user, query, filter_type=f))
         return Response(
             {
                 "query": query,
+                "filter": f,
                 "count": len(chats),
-                "results": RecentConversationSerializer(chats, many=True).data,
+                "results": RecentConversationSerializer(chats, many=True, context={"request": request}).data,
             }
         )
 
@@ -2451,6 +3413,7 @@ class SearchMessagesView(APIView):
     def get(self, request):
         query = get_query_param(request)
         chat_id = request.query_params.get("chat_id")
+        f = request.query_params.get("filter") or request.query_params.get("type") or "all"
 
         if chat_id and not ConversationParticipant.objects.filter(
             user=request.user,
@@ -2462,10 +3425,11 @@ class SearchMessagesView(APIView):
                 status=404,
             )
 
-        messages = list(search_messages_queryset(request.user, query, chat_id))
+        messages = list(search_messages_queryset(request.user, query, filter_type=f, chat_id=chat_id))
         return Response(
             {
                 "query": query,
+                "filter": f,
                 "chat_id": chat_id,
                 "count": len(messages),
                 "results": MessageSearchResultSerializer(
@@ -2477,40 +3441,149 @@ class SearchMessagesView(APIView):
         )
 
 
-class UnifiedSearchView(APIView):
-    """Search users, chats, and messages in one request."""
+class SearchFilesView(APIView):
+    """Search files and media (photos, videos, documents, audio) across chats."""
 
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
         query = get_query_param(request)
         chat_id = request.query_params.get("chat_id")
+        file_type = request.query_params.get("type") or request.query_params.get("filter") or "all"
+        files = list(search_files_queryset(request.user, query, filter_type=file_type, chat_id=chat_id))
+        return Response({
+            "query": query,
+            "filter": file_type,
+            "type": file_type,
+            "count": len(files),
+            "results": [serialize_search_file_result(f, request) for f in files],
+        })
 
-        users = list(search_users_queryset(request.user, query))
-        chats = list(search_chats_queryset(request.user, query))
-        messages = list(search_messages_queryset(request.user, query, chat_id))
 
-        return Response(
-            {
-                "query": query,
-                "users": {
-                    "count": len(users),
-                    "results": PublicProfileSerializer(users, many=True).data,
-                },
-                "chats": {
-                    "count": len(chats),
-                    "results": RecentConversationSerializer(chats, many=True).data,
-                },
-                "messages": {
-                    "count": len(messages),
-                    "results": MessageSearchResultSerializer(
-                        messages,
-                        many=True,
-                        context={"request": request},
-                    ).data,
-                },
-            }
-        )
+class UnifiedSearchView(APIView):
+    """
+    Search chats, messages, files with quick filter pills:
+    - Search input placeholder: "Search chats, messages, files"
+    - Quick filter pills: Unread, Groups, Photos, Videos (and All)
+
+    GET /api/search/?q=...&filter=...
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        query = get_query_param(request)
+        chat_id = request.query_params.get("chat_id")
+        raw_filter = request.query_params.get("filter") or request.query_params.get("type") or request.query_params.get("tab") or "all"
+        active_filter = str(raw_filter).lower().strip()
+        if active_filter not in ("all", "unread", "groups", "photos", "videos", "photo", "video", "image", "images", "files", "documents"):
+            active_filter = "all"
+
+        canonical_filter = "all"
+        if active_filter in ("photos", "photo", "image", "images"):
+            canonical_filter = "photos"
+        elif active_filter in ("videos", "video"):
+            canonical_filter = "videos"
+        elif active_filter == "groups":
+            canonical_filter = "groups"
+        elif active_filter == "unread":
+            canonical_filter = "unread"
+        elif active_filter in ("files", "documents"):
+            canonical_filter = "files"
+
+        # Querysets for the active filter
+        chats_qs = search_chats_queryset(request.user, query, filter_type=canonical_filter)
+        messages_qs = search_messages_queryset(request.user, query, filter_type=canonical_filter, chat_id=chat_id)
+        files_qs = search_files_queryset(request.user, query, filter_type=canonical_filter, chat_id=chat_id)
+        users_qs = search_users_queryset(request.user, query) if canonical_filter in ("all", "chats") else User.objects.none()
+
+        chats_list = list(chats_qs)
+        messages_list = list(messages_qs)
+        files_list = list(files_qs)
+        users_list = list(users_qs)
+
+        serialized_chats = RecentConversationSerializer(chats_list, many=True, context={"request": request}).data
+        serialized_messages = MessageSearchResultSerializer(messages_list, many=True, context={"request": request}).data
+        serialized_files = [serialize_search_file_result(f, request) for f in files_list]
+        serialized_users = PublicProfileSerializer(users_list, many=True, context={"request": request}).data
+
+        # Calculate pill counts
+        if query:
+            count_unread = len(search_chats_queryset(request.user, query, "unread")) + len(search_messages_queryset(request.user, query, "unread"))
+            count_groups = len(search_chats_queryset(request.user, query, "groups"))
+            count_photos = len(search_files_queryset(request.user, query, "photos"))
+            count_videos = len(search_files_queryset(request.user, query, "videos"))
+        else:
+            count_unread = ConversationParticipant.objects.filter(
+                user=request.user, deleted_at__isnull=True, is_archived=False, unread_count__gt=0
+            ).count()
+            count_groups = ConversationParticipant.objects.filter(
+                user=request.user, deleted_at__isnull=True, conversation__type="group"
+            ).count()
+            user_cids = ConversationParticipant.objects.filter(
+                user=request.user, deleted_at__isnull=True
+            ).values_list("conversation_id", flat=True)
+            count_photos = Message.objects.filter(
+                conversation_id__in=user_cids, message_type="image"
+            ).count()
+            count_videos = Message.objects.filter(
+                conversation_id__in=user_cids, message_type="video"
+            ).count()
+
+        total_matching = len(chats_list) + len(messages_list) + len(files_list)
+
+        filter_pills = [
+            {"id": "all", "label": "All", "count": total_matching, "is_active": canonical_filter == "all"},
+            {"id": "unread", "label": "Unread", "count": count_unread, "is_active": canonical_filter == "unread"},
+            {"id": "groups", "label": "Groups", "count": count_groups, "is_active": canonical_filter == "groups"},
+            {"id": "photos", "label": "Photos", "count": count_photos, "is_active": canonical_filter == "photos"},
+            {"id": "videos", "label": "Videos", "count": count_videos, "is_active": canonical_filter == "videos"},
+        ]
+
+        if canonical_filter == "photos":
+            focused_results = serialized_files
+        elif canonical_filter == "videos":
+            focused_results = serialized_files
+        elif canonical_filter == "groups":
+            focused_results = serialized_chats
+        elif canonical_filter == "unread":
+            focused_results = serialized_chats + serialized_messages
+        else:
+            focused_results = serialized_chats + serialized_messages + serialized_files
+
+        return Response({
+            "query": query,
+            "filter": canonical_filter,
+            "placeholder": "Search chats, messages, files",
+            "filter_pills": filter_pills,
+            "counts": {
+                "total": total_matching,
+                "chats": len(chats_list),
+                "messages": len(messages_list),
+                "files": len(files_list),
+                "unread": count_unread,
+                "groups": count_groups,
+                "photos": count_photos,
+                "videos": count_videos,
+            },
+            "results": focused_results,
+            "chats": {
+                "count": len(chats_list),
+                "results": serialized_chats,
+            },
+            "messages": {
+                "count": len(messages_list),
+                "results": serialized_messages,
+            },
+            "files": {
+                "count": len(files_list),
+                "results": serialized_files,
+            },
+            "users": {
+                "count": len(users_list),
+                "results": serialized_users,
+            },
+        })
 
 
 # --- Appended from typing_views.py ---

@@ -44,6 +44,7 @@ from .views import (
     AdminActivityLogListView,
     AdminAnalyticsView,
     # Settings
+    ExiSettingsHubView,
     UnifiedSettingsView,
     NotificationSettingsView,
     NotificationMuteView,
@@ -107,6 +108,11 @@ from .views import (
     BusinessProductDetailView,
     BusinessOffersView,
     BusinessCustomerChatView,
+    BusinessRecommendView,
+    PublicBusinessProfileView,
+    BusinessEnquiryView,
+    BusinessSayHiView,
+    RecommendRecipientsView,
     HelpCenterView,
     HelpArticleView,
     ReportProblemView,
@@ -161,6 +167,11 @@ urlpatterns = [
     # Login & Auth
     path("auth/login/", LoginView.as_view()),
     path("auth/logout/", LogoutView.as_view()),
+    path("auth/delete-account/", DeleteAccountView.as_view()),
+    path("logout/", LogoutView.as_view()),
+    path("account/logout/", LogoutView.as_view()),
+    path("account/delete/", DeleteAccountView.as_view()),
+    path("account/delete-account/", DeleteAccountView.as_view()),
     path("auth/forgot-password/", ForgotPasswordView.as_view()),
     path("auth/reset-password/", ResetPasswordView.as_view()),
     path("auth/token/refresh/", TokenRefreshView.as_view()),
@@ -275,9 +286,11 @@ urlpatterns = [
     path("admin/activity-logs/", AdminActivityLogListView.as_view()),
     path("admin/analytics/", AdminAnalyticsView.as_view()),
 
-    # Settings - Unified, Notifications, Chats, Appearance, Storage
+    # Settings - Unified, Hub, Notifications, Chats, Appearance, Storage
     path("settings/", UnifiedSettingsView.as_view()),
     path("settings/all/", UnifiedSettingsView.as_view()),
+    path("settings/hub/", ExiSettingsHubView.as_view()),
+    path("settings/exi/", ExiSettingsHubView.as_view()),
 
     # Notifications Settings
     path("settings/notifications/", NotificationSettingsView.as_view()),
@@ -332,6 +345,7 @@ urlpatterns = [
     path("settings/groups/invitations/", GroupInvitationsPreferenceView.as_view()),
     path("settings/groups/member-approval/", GroupMemberApprovalPreferenceView.as_view()),
     path("settings/groups/admin-controls/", GroupAdminControlsPreferenceView.as_view()),
+    path("settings/groups/admin-permissions/", GroupAdminControlsPreferenceView.as_view()),
     path("settings/groups/visibility/", GroupInfoVisibilityView.as_view()),
     path("settings/groups/recent/", RecentGroupsView.as_view()),
 
@@ -345,6 +359,17 @@ urlpatterns = [
     # Business
     path("business/setup/", BusinessSetupView.as_view()),
     path("business/profile/", BusinessProfileView.as_view()),
+    path("business/search/", NearbyBusinessesView.as_view()),
+    path("business/recommend/", BusinessRecommendView.as_view()),
+    path("business/<int:business_id>/recommend/", BusinessRecommendView.as_view()),
+    path("business/recommend/recipients/", RecommendRecipientsView.as_view()),
+    path("business/say-hi/", BusinessSayHiView.as_view()),
+    path("business/<str:business_identifier>/say-hi/", BusinessSayHiView.as_view()),
+    path("business/<str:business_identifier>/public/", PublicBusinessProfileView.as_view()),
+    path("business/<str:business_identifier>/profile/", PublicBusinessProfileView.as_view()),
+    path("biz/<str:business_identifier>/", PublicBusinessProfileView.as_view()),
+    path("business/enquire/", BusinessEnquiryView.as_view()),
+    path("business/<str:business_identifier>/enquire/", BusinessEnquiryView.as_view()),
     path("business/products/", BusinessProductsView.as_view()),
     path("business/products/<str:product_id>/", BusinessProductDetailView.as_view()),
     path("business/offers/", BusinessOffersView.as_view()),
@@ -364,6 +389,9 @@ urlpatterns = [
     path("users/find/", FindOnExiView.as_view()),
     path("users/qr/", UserQRCodeView.as_view()),
     path("users/qr/scan/", UserQRCodeView.as_view()),
+    path("code/resolve/", UserQRCodeView.as_view()),
+    path("qr/resolve/", UserQRCodeView.as_view()),
+    path("chats/recipients/", RecommendRecipientsView.as_view()),
 
     # Status (Stories) Workflow (Add Status, Photo/Video/Text, Captions, Visibility, Viewers, 24h Expiry)
     path("status/", StatusCreateView.as_view()),

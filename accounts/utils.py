@@ -192,14 +192,27 @@ def privacy_settings_or_default(user):
     )
 
 
-def visibility_allows(owner, viewer, setting_value):
-    """Resolve an 'everyone' / 'contacts' / 'nobody' privacy choice."""
-    if viewer is not None and owner.id == getattr(viewer, 'id', None):
+def visibility_allows(owner, viewer, setting_value, excluded_list=None):
+    """Resolve an 'everyone' / 'contacts' / 'contacts_except' / 'nobody' privacy choice."""
+    if viewer is not None and getattr(owner, 'id', None) == getattr(viewer, 'id', None):
         return True
-    if setting_value == 'everyone':
+    setting_value = str(setting_value or "").lower().strip()
+    if setting_value in ('everyone', 'all', 'anyone'):
         return True
-    if setting_value == 'nobody':
+    if setting_value in ('nobody', 'none', 'no_one'):
         return False
+    if setting_value in ('contacts_except', 'my_contacts_except'):
+        if not are_contacts(owner, viewer):
+            return False
+        if excluded_list:
+            viewer_id = getattr(viewer, 'id', None)
+            viewer_phone = getattr(viewer, 'phone', None)
+            excluded_strs = {str(x).strip() for x in excluded_list}
+            if viewer_id is not None and str(viewer_id) in excluded_strs:
+                return False
+            if viewer_phone and str(viewer_phone) in excluded_strs:
+                return False
+        return True
     return are_contacts(owner, viewer)
 
 
@@ -232,6 +245,19 @@ def can_call(caller, callee):
     return visibility_allows(callee, caller, setting)
 
 
+def can_see_typing(owner, viewer):
+    """Whether viewer is allowed to see owner's typing indicator."""
+    if not owner or not viewer or getattr(owner, 'id', None) == getattr(viewer, 'id', None):
+        return True
+    from accounts.user_preferences import get_section_preferences
+    user_prefs = get_section_preferences(owner.id, "privacy") or {}
+    setting = user_prefs.get("typing_indicator", "everyone")
+    if isinstance(setting, bool):
+        setting = "everyone" if setting else "nobody"
+    except_list = user_prefs.get("typing_indicator_except", user_prefs.get("typing_excluded_contacts", []))
+    return visibility_allows(owner, viewer, setting, excluded_list=except_list)
+
+
 def visible_profile_fields(owner, viewer):
     """Which optional profile fields `viewer` may see on `owner`'s profile."""
     from accounts.user_preferences import get_section_preferences
@@ -251,17 +277,28 @@ def visible_profile_fields(owner, viewer):
     # Online status (with same_as_last_seen support)
     online_setting = user_prefs.get("online_status", "everyone")
     last_seen_setting = user_prefs.get("last_seen", "everyone" if prefs.show_last_seen else "nobody")
+    last_seen_except = user_prefs.get("last_seen_except", user_prefs.get("last_seen_excluded_contacts", []))
+
+    last_seen_allowed = visibility_allows(owner, viewer, last_seen_setting, excluded_list=last_seen_except)
 
     if online_setting == "same_as_last_seen":
-        online_allowed = visibility_allows(owner, viewer, last_seen_setting)
+        online_allowed = last_seen_allowed
+    elif online_setting == "nobody":
+        online_allowed = False
+    elif online_setting in ("contacts_except", "my_contacts_except"):
+        online_except = user_prefs.get("online_status_except", [])
+        online_allowed = visibility_allows(owner, viewer, "contacts_except", excluded_list=online_except)
+    elif online_setting == "contacts":
+        online_allowed = visibility_allows(owner, viewer, "contacts")
     else:
         online_allowed = visibility_allows(
             owner, viewer, "everyone" if prefs.show_online_status and online_setting == "everyone" else online_setting
         )
 
-    last_seen_allowed = visibility_allows(owner, viewer, last_seen_setting)
+    photo_except = user_prefs.get("profile_photo_except", [])
     photo_allowed = visibility_allows(
-        owner, viewer, user_prefs.get("profile_photo", "everyone" if prefs.show_profile_photo else "nobody")
+        owner, viewer, user_prefs.get("profile_photo", "everyone" if prefs.show_profile_photo else "nobody"),
+        excluded_list=photo_except
     )
 
     # Show EXI ID on profile (if False, hidden from profile when viewed by others)
@@ -270,7 +307,9 @@ def visible_profile_fields(owner, viewer):
     exi_id_allowed = True if is_self else show_exi_id
 
     # About / Bio
-    about_allowed = visibility_allows(owner, viewer, user_prefs.get("about", "everyone"))
+    about_setting = user_prefs.get("about", "everyone")
+    about_except = user_prefs.get("about_except", user_prefs.get("about_excluded_contacts", []))
+    about_allowed = visibility_allows(owner, viewer, about_setting, excluded_list=about_except)
 
     return {
         'online_status': online_allowed,

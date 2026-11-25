@@ -68,12 +68,16 @@ class RecentConversationSerializer(serializers.ModelSerializer):
     participants = serializers.SerializerMethodField()
     last_message = serializers.SerializerMethodField()
     permissions = serializers.SerializerMethodField()
+    name = serializers.SerializerMethodField()
+    is_group = serializers.SerializerMethodField()
 
     class Meta:
         model = ConversationParticipant
         fields = [
             'conversation_id', 
             'type', 
+            'name',
+            'is_group',
             'is_pinned', 
             'is_archived', 
             'is_muted',
@@ -85,6 +89,24 @@ class RecentConversationSerializer(serializers.ModelSerializer):
             'permissions',
         ]
 
+    def get_is_group(self, obj):
+        conv = getattr(obj, 'conversation', None)
+        return bool(conv and conv.type == 'group')
+
+    def get_name(self, obj):
+        conv = getattr(obj, 'conversation', None)
+        if conv and conv.type == 'group':
+            from .group_views import _get_group_meta
+            meta = _get_group_meta(obj.conversation_id)
+            if meta and meta.get("name"):
+                return meta["name"]
+            return "Group Chat"
+        if conv:
+            other = conv.participants.exclude(id=obj.user_id).first()
+            if other:
+                return getattr(other, 'display_name', '') or other.username
+        return "Chat"
+
     def get_permissions(self, obj):
         from .chat_permissions import get_chat_permissions_display
         cid = getattr(obj, 'conversation_id', getattr(obj, 'id', None))
@@ -95,7 +117,7 @@ class RecentConversationSerializer(serializers.ModelSerializer):
         # In a real app, you'd want to use prefetch_related and avoid queries in loop.
         # This gets all participants EXCEPT the current user
         users = obj.conversation.participants.exclude(id=obj.user_id)
-        return ParticipantUserSerializer(users, many=True).data
+        return ParticipantUserSerializer(users, many=True, context=self.context).data
 
     def get_last_message(self, obj):
         from django.utils import timezone
@@ -145,7 +167,7 @@ class MessageSerializer(serializers.ModelSerializer):
     def get_attachment_data(self, obj):
         import json
         mtype = obj.message_type
-        if mtype in ('contact', 'location', 'capsule', 'exi_pop'):
+        if mtype in ('contact', 'location', 'capsule', 'exi_pop', 'poll', 'business'):
             try:
                 data = json.loads(obj.content)
                 if isinstance(data, dict):
@@ -154,12 +176,105 @@ class MessageSerializer(serializers.ModelSerializer):
                         now = timezone.now()
                         request = self.context.get('request')
                         is_sender = request and request.user.id == obj.sender_id
-                        is_unlocked = now >= obj.scheduled_for
+                        is_unlocked = bool(data.get('is_unlocked')) or (now >= obj.scheduled_for)
+                        countdown_seconds = max(0, int((obj.scheduled_for - now).total_seconds())) if obj.scheduled_for > now else 0
+
                         data['is_unlocked'] = is_unlocked
+                        data['countdown_seconds'] = countdown_seconds
+                        data['unlock_at'] = obj.scheduled_for.isoformat()
+                        data['open_endpoint'] = f"/api/chats/{obj.conversation_id}/attachments/time-capsule/{obj.id}/open/"
+
+                        raw_passcode = (data.get('passcode') or '').strip()
+                        has_passcode = bool(raw_passcode)
+                        is_opened = bool(data.get('is_opened', False))
+                        data['has_passcode'] = has_passcode
+                        data['is_opened'] = is_opened
+                        data['is_passcode_required'] = has_passcode and not is_opened
+                        data.setdefault('capsule_type', 'time_capsule')
+                        data.setdefault('reveal_style', 'animated')
+                        data.setdefault('letter_theme', 'classic')
+                        data.setdefault('occasion', 'secret')
+                        data['memories_count'] = len(data.get('memories') or [])
+                        if data.get('capsule_type') == 'secret_letter':
+                            data.setdefault('theme_details', LETTER_THEME_CONFIG.get(data.get('letter_theme', 'classic'), LETTER_THEME_CONFIG['classic']))
+
+                        # Security redaction
+                        if not is_sender:
+                            data.pop('passcode', None)
+
+                        # If locked or passcode required and not yet opened
                         if not is_unlocked and not is_sender:
                             data['secret_content'] = None
                             data['content'] = None
+                            data['note'] = None
                             data['message'] = None
+                            data['memories'] = []
+                        elif is_unlocked and has_passcode and not is_opened and not is_sender:
+                            data['secret_content'] = None
+                            data['content'] = None
+                            data['note'] = None
+                            data['message'] = None
+                            data['memories'] = []
+                    elif mtype == 'business':
+                        data.setdefault('can_chat', True)
+                        data.setdefault('can_view_catalog', True)
+                        data.setdefault('can_enquire', True)
+                        share_ident = data.get('business_exi_id') or data.get('business_id') or ''
+                        if share_ident:
+                            data.setdefault('share_url', f"https://exi.chat/biz/{share_ident}")
+                            data.setdefault('profile_url', f"/api/business/{share_ident}/public/")
+                            data.setdefault('enquiry_url', f"/api/business/{share_ident}/enquire/")
+                            data.setdefault('chat_url', f"/api/chats/start/?exi_id={share_ident}")
+                    elif mtype == 'poll':
+                        from django.utils import timezone
+                        now = timezone.now()
+                        request = self.context.get('request')
+                        user_id = request.user.id if request and request.user.is_authenticated else None
+
+                        options = data.get('options', [])
+                        total_votes = sum(len(opt.get('voter_ids', [])) for opt in options)
+                        data['total_votes'] = total_votes
+
+                        expires_at = data.get('expires_at')
+                        is_expired = False
+                        if expires_at:
+                            try:
+                                from django.utils.dateparse import parse_datetime
+                                exp_dt = parse_datetime(expires_at)
+                                if exp_dt and now >= exp_dt:
+                                    is_expired = True
+                            except Exception:
+                                pass
+
+                        is_closed = data.get('is_closed', False) or is_expired
+                        data['is_closed'] = is_closed
+                        data['is_expired'] = is_expired
+
+                        is_anon = data.get('is_anonymous', False)
+                        my_votes = []
+                        formatted_options = []
+                        for opt in options:
+                            voter_ids = opt.get('voter_ids', [])
+                            vote_count = len(voter_ids)
+                            percentage = round((vote_count / total_votes * 100), 1) if total_votes > 0 else 0.0
+                            opt_id = opt.get('id')
+                            if user_id and user_id in voter_ids:
+                                my_votes.append(opt_id)
+
+                            f_opt = {
+                                'id': opt_id,
+                                'text': opt.get('text', ''),
+                                'vote_count': vote_count,
+                                'percentage': percentage,
+                            }
+                            if not is_anon:
+                                f_opt['voter_ids'] = voter_ids
+                            formatted_options.append(f_opt)
+
+                        data['options'] = formatted_options
+                        data['my_votes'] = my_votes
+                        data['has_voted'] = len(my_votes) > 0
+                        data['can_vote'] = not is_closed
                     return data
             except (ValueError, TypeError):
                 pass
@@ -395,19 +510,156 @@ class LocationAttachmentSerializer(serializers.Serializer):
         return data
 
 
+LETTER_THEME_CONFIG = {
+    "classic": {
+        "id": "classic",
+        "name": "Classic Parchment",
+        "paper_texture": "parchment",
+        "background_color": "#FBF5E6",
+        "text_color": "#2C221E",
+        "font_family": "serif",
+        "seal_color": "#C59B27",  # Gold wax seal
+        "seal_icon": "feather",
+        "border_style": "double-gold",
+    },
+    "love": {
+        "id": "love",
+        "name": "Love Letter",
+        "paper_texture": "rose_linen",
+        "background_color": "#FFF0F3",
+        "text_color": "#591C2B",
+        "font_family": "cursive",
+        "seal_color": "#D90429",  # Ruby red heart wax seal
+        "seal_icon": "heart",
+        "border_style": "romantic-rose",
+    },
+    "birthday": {
+        "id": "birthday",
+        "name": "Birthday Letter",
+        "paper_texture": "confetti_ivory",
+        "background_color": "#FAF0CA",
+        "text_color": "#3D348B",
+        "font_family": "decorative",
+        "seal_color": "#7209B7",  # Festive purple wax seal
+        "seal_icon": "party_popper",
+        "border_style": "festive_confetti",
+    },
+    "modern": {
+        "id": "modern",
+        "name": "Modern Minimalist",
+        "paper_texture": "matte_smooth",
+        "background_color": "#F8F9FA",
+        "text_color": "#212529",
+        "font_family": "sans-serif",
+        "seal_color": "#495057",  # Silver / graphite geometric seal
+        "seal_icon": "shield",
+        "border_style": "minimal_black",
+    },
+}
+
+
 class TimeCapsuleAttachmentSerializer(serializers.Serializer):
-    """Attachment: Time Capsule scheduled message with lock/unlock rules."""
-    content = serializers.CharField(max_length=5000, required=True)
-    unlock_at = serializers.DateTimeField(required=True)
+    """
+    Attachment: Time Capsule & Secret Letter scheduled message with lock/unlock rules.
+    Supports 10-step lifecycle:
+    - Types: time_capsule, secret_letter
+    - Occasions: birthday, future_you, milestone, secret
+    - Memories: photos, voice recordings, videos
+    - Unlock presets: tomorrow, one_week, one_month, custom datetime
+    - Settings: reveal_style (animated/classic), letter_theme (classic/love/birthday/modern), passcode & hint
+    """
+    CAPSULE_TYPES = (
+        ("time_capsule", "Time Capsule"),
+        ("secret_letter", "Secret Letter"),
+        ("capsule", "Time Capsule"),
+        ("letter", "Secret Letter"),
+    )
+    OCCASIONS = (
+        ("birthday", "Birthday"),
+        ("future_you", "Future You"),
+        ("milestone", "Milestone"),
+        ("secret", "Secret"),
+        ("general", "General"),
+    )
+    UNLOCK_PRESETS = (
+        ("tomorrow", "Tomorrow"),
+        ("one_week", "One Week"),
+        ("one_month", "One Month"),
+        ("custom", "Custom Date & Time"),
+    )
+    REVEAL_STYLES = (
+        ("animated", "Animated Reveal"),
+        ("classic", "Classic Reveal"),
+    )
+    LETTER_THEMES = (
+        ("classic", "Classic"),
+        ("love", "Love"),
+        ("birthday", "Birthday"),
+        ("modern", "Modern"),
+    )
+
+    capsule_type = serializers.ChoiceField(choices=CAPSULE_TYPES, default="time_capsule", required=False)
     title = serializers.CharField(max_length=150, required=False, allow_blank=True, default="")
+    content = serializers.CharField(max_length=5000, required=False, allow_blank=True, default="")
+    note = serializers.CharField(max_length=5000, required=False, allow_blank=True, default="")
+    secret_content = serializers.CharField(max_length=5000, required=False, allow_blank=True, default="")
+    occasion = serializers.ChoiceField(choices=OCCASIONS, required=False, default="secret")
+    memories = serializers.ListField(child=serializers.DictField(), required=False, default=list)
+    unlock_preset = serializers.ChoiceField(choices=UNLOCK_PRESETS, required=False, default="custom")
+    unlock_at = serializers.DateTimeField(required=False, allow_null=True, default=None)
+    reveal_style = serializers.ChoiceField(choices=REVEAL_STYLES, required=False, default="animated")
+    letter_theme = serializers.ChoiceField(choices=LETTER_THEMES, required=False, default="classic")
+    passcode = serializers.CharField(max_length=50, required=False, allow_blank=True, default="")
+    passcode_hint = serializers.CharField(max_length=200, required=False, allow_blank=True, default="")
     lock_hint = serializers.CharField(max_length=300, required=False, allow_blank=True, default="")
     theme = serializers.CharField(max_length=50, required=False, default="golden")
 
-    def validate_unlock_at(self, value):
+    def validate(self, data):
         from django.utils import timezone
-        if value <= timezone.now():
-            raise serializers.ValidationError("Time Capsule unlock date must be in the future.")
-        return value
+        from datetime import timedelta
+
+        # 1. Resolve note / secret_content / content
+        note_text = (data.get("content") or data.get("note") or data.get("secret_content") or "").strip()
+        memories = data.get("memories") or []
+        if not note_text and not memories:
+            raise serializers.ValidationError({
+                "content": "Please provide a secret note or attach at least one memory."
+            })
+        data["content"] = note_text
+        data["note"] = note_text
+        data["secret_content"] = note_text
+
+        # 2. Compute unlock_at based on preset if unlock_at is None
+        preset = data.get("unlock_preset") or "custom"
+        now = timezone.now()
+        unlock_at = data.get("unlock_at")
+
+        if preset == "tomorrow":
+            unlock_at = now + timedelta(days=1)
+        elif preset == "one_week":
+            unlock_at = now + timedelta(days=7)
+        elif preset == "one_month":
+            unlock_at = now + timedelta(days=30)
+        elif not unlock_at:
+            raise serializers.ValidationError({
+                "unlock_at": "An unlock date and time is required."
+            })
+
+        if unlock_at <= now:
+            raise serializers.ValidationError({
+                "unlock_at": "Time Capsule unlock date must be in the future."
+            })
+
+        data["unlock_at"] = unlock_at
+
+        # 3. Normalize capsule_type
+        raw_type = data.get("capsule_type", "time_capsule")
+        if raw_type in ("secret_letter", "letter"):
+            data["capsule_type"] = "secret_letter"
+        else:
+            data["capsule_type"] = "time_capsule"
+
+        return data
 
 
 class ExiPopAttachmentSerializer(serializers.Serializer):
@@ -429,10 +681,93 @@ class ExiPopAttachmentSerializer(serializers.Serializer):
     interactive_data = serializers.DictField(required=False, default=dict)
 
 
+class PollCreateSerializer(serializers.Serializer):
+    """Serializer for creating a group chat poll."""
+    question = serializers.CharField(max_length=500, required=True)
+    options = serializers.ListField(
+        child=serializers.CharField(max_length=200),
+        min_length=2,
+        max_length=12,
+        required=True
+    )
+    allow_multiple_answers = serializers.BooleanField(required=False, default=False)
+    is_anonymous = serializers.BooleanField(required=False, default=False)
+    expires_at = serializers.DateTimeField(required=False, allow_null=True, default=None)
+
+    def validate_options(self, value):
+        cleaned = [opt.strip() for opt in value if opt and opt.strip()]
+        if len(cleaned) < 2:
+            raise serializers.ValidationError("A poll must have at least 2 non-empty options.")
+        if len(cleaned) != len(set(cleaned)):
+            raise serializers.ValidationError("Poll options must be unique.")
+        return cleaned
+
+    def validate_expires_at(self, value):
+        if value:
+            from django.utils import timezone
+            if value <= timezone.now():
+                raise serializers.ValidationError("Poll expiration date must be in the future.")
+        return value
+
+
+class PollVoteSerializer(serializers.Serializer):
+    """Serializer for submitting a vote on a poll."""
+    option_ids = serializers.ListField(
+        child=serializers.CharField(max_length=50),
+        min_length=1,
+        required=True
+    )
+
+
+class BusinessAttachmentSerializer(serializers.Serializer):
+    """Serializer for directly sharing/recommending a business card into a chat."""
+    business_id = serializers.IntegerField(required=False)
+    business_exi_id = serializers.CharField(max_length=32, required=False, allow_blank=True)
+    business_name = serializers.CharField(max_length=150, required=False, allow_blank=True)
+    category = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    address = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    website = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    note = serializers.CharField(max_length=500, required=False, allow_blank=True, default="")
+    personal_message = serializers.CharField(max_length=500, required=False, allow_blank=True, default="")
+    avatar_url = serializers.CharField(required=False, allow_blank=True)
+    share_url = serializers.CharField(required=False, allow_blank=True)
+    profile_url = serializers.CharField(required=False, allow_blank=True)
+
+
+class BusinessRecommendationSerializer(serializers.Serializer):
+    """Serializer for recommending/sharing a business profile to contacts and chats."""
+    business_id = serializers.IntegerField(required=False)
+    business_exi_id = serializers.CharField(max_length=32, required=False, allow_blank=True)
+    conversation_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        default=list
+    )
+    contact_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        required=False,
+        default=list
+    )
+    phone_numbers = serializers.ListField(
+        child=serializers.CharField(max_length=50),
+        required=False,
+        default=list
+    )
+    note = serializers.CharField(max_length=500, required=False, allow_blank=True, default="")
+    personal_message = serializers.CharField(max_length=500, required=False, allow_blank=True, default="")
+
+    def validate(self, data):
+        if not data.get("business_id") and not data.get("business_exi_id"):
+            raise serializers.ValidationError("Either business_id or business_exi_id must be provided.")
+        if not data.get("conversation_ids") and not data.get("contact_ids") and not data.get("phone_numbers"):
+            raise serializers.ValidationError("At least one conversation_id, contact_id, or phone_number must be provided.")
+        return data
+
+
 class UnifiedAttachmentSerializer(serializers.Serializer):
     """
-    Unified attachment intake serializer for the 7 Attachment Menu actions:
-    Camera, Photos, Documents, Contacts, Location, Time Capsule, EXI Pop.
+    Unified attachment intake serializer for the Attachment Menu actions:
+    Camera, Photos, Documents, Contacts, Location, Time Capsule, EXI Pop, Poll, Business.
     """
     ATTACHMENT_TYPES = (
         ("camera", "Camera"),
@@ -443,8 +778,14 @@ class UnifiedAttachmentSerializer(serializers.Serializer):
         ("location", "Location"),
         ("time_capsule", "Time Capsule"),
         ("capsule", "Time Capsule"),
+        ("secret_letter", "Secret Letter"),
+        ("letter", "Secret Letter"),
         ("exi_pop", "EXI Pop"),
         ("pop", "EXI Pop"),
+        ("poll", "Poll"),
+        ("polls", "Poll"),
+        ("business", "Business Card"),
+        ("business_card", "Business Card"),
     )
     attachment_type = serializers.ChoiceField(choices=ATTACHMENT_TYPES)
     # Media inputs (Camera, Photos, Documents)
@@ -455,7 +796,10 @@ class UnifiedAttachmentSerializer(serializers.Serializer):
     contact = ContactAttachmentSerializer(required=False)
     location = LocationAttachmentSerializer(required=False)
     time_capsule = TimeCapsuleAttachmentSerializer(required=False)
+    secret_letter = TimeCapsuleAttachmentSerializer(required=False)
     exi_pop = ExiPopAttachmentSerializer(required=False)
+    poll = PollCreateSerializer(required=False)
+    business = BusinessAttachmentSerializer(required=False)
 
 
 class StartConversationSerializer(serializers.Serializer):

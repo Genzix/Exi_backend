@@ -31,6 +31,8 @@ DEFAULT_PREFERENCES = {
         "call_ringtone": "default",
         "call_vibration": "default",
         "sounds": True,
+        "in_app_sound_effects": True,
+        "group_notifications": True,
         "vibration": True,
         "preview": True,
         "hide_content_on_lock_screen": False,
@@ -39,6 +41,21 @@ DEFAULT_PREFERENCES = {
         "mute_until": None,  # ISO 8601 string or None
     },
     "chats": {
+        "theme": "system",  # "light", "dark", "system"
+        "chat_wallpaper": {
+            "preset": "default",
+            "url": "",
+            "color": "#0F172A",
+            "blur": 0,
+            "opacity": 1.0,
+        },
+        "font_size": "medium",  # "small", "medium", "large"
+        "show_link_previews": True,
+        "auto_download_media": "wifi_only",  # "wifi_only", "wifi_and_cellular", "never"
+        "media_quality": "standard",  # "data_saver", "standard", "hd_quality"
+        "read_receipts": True,
+        "typing_indicator": True,
+        "message_reactions": True,
         "auto_backup_frequency": "off",  # "off", "daily", "weekly", "monthly"
         "backup_over_wifi_only": True,
         "include_videos": True,
@@ -49,8 +66,6 @@ DEFAULT_PREFERENCES = {
         "enter_is_send": False,
         "enter_to_send": False,
         "keep_chats_archived": True,
-        "show_link_previews": True,
-        "message_reactions": True,
         "edit_messages": True,
         "forwarding_information": True,
     },
@@ -81,32 +96,42 @@ DEFAULT_PREFERENCES = {
         "save_photos_to_gallery": True,
         "save_videos_to_gallery": True,
         "exi_media_folder": True,
-        "upload_quality": "standard", # "standard", "high"
-        "download_quality": "standard", # "standard", "high"
+        "upload_quality": "standard",  # "standard", "high"
+        "download_quality": "standard",  # "standard", "high"
         "use_wifi_for_large_files": True,
         "cache_last_cleared_at": None,
     },
     "privacy": {
         # Finding You
-        "find_by_exi_id": "everyone",           # "everyone", "contacts", "nobody"
-        "find_by_id": "everyone",               # alias
-        "find_by_phone": "everyone",            # "everyone", "contacts", "nobody"
-        "show_exi_id_on_profile": True,         # True/False (if False, EXI ID is hidden on public profile)
-        "message_requests": True,               # True/False (if False, non-contacts cannot start chat)
+        "find_by_exi_id": "everyone",
+        "find_by_id": "everyone",
+        "find_by_phone": "everyone",
+        "show_exi_id_on_profile": True,
+        "message_requests": True,
 
         # Activity Privacy
-        "last_seen": "everyone",         # "everyone", "contacts", "nobody"
-        "online_status": "everyone",     # "everyone", "same_as_last_seen", "nobody"
-        "typing_indicator": "everyone",  # "everyone", "contacts", "nobody"
-        "read_receipts": True,           # True/False
+        "last_seen": "everyone",
+        "last_seen_except": [],
+        "online_status": "everyone",
+        "online_status_except": [],
+        "typing_indicator": "everyone",
+        "typing_indicator_except": [],
+        "read_receipts": True,
 
         # Profile Privacy
-        "notification_sound": "default", # "default", "chime", "pop", "subtle", "none"
-        "profile_photo": "everyone",     # "everyone", "contacts", "nobody"
-        "about": "everyone",             # "everyone", "contacts", "nobody"
-        "status": "contacts",            # "everyone", "contacts", "selected", "nobody"
+        "notification_sound": "default",
+        "notification_sound_audience": "everyone",
+        "notification_sound_except": [],
+        "notification_sound_tone": "default",
+        "profile_photo": "everyone",
+        "profile_photo_except": [],
+        "about": "everyone",
+        "about_except": [],
+        "status": "contacts",
+        "status_except": [],
         "status_selected_contacts": [],
-        "groups": "everyone",            # "everyone", "contacts", "nobody"
+        "groups": "everyone",
+        "groups_except": [],
         "add_to_groups": "everyone",     # alias
         "restricted_users": [],          # List of user IDs that are restricted
         "location_sharing": "when_shared", # "never", "when_shared", "live"
@@ -207,14 +232,26 @@ DEFAULT_PREFERENCES = {
         "exact_only_when_chosen": True,
     },
     "group_settings": {
-        "who_can_add_to_groups": "everyone",      # "everyone", "contacts", "nobody"
-        "who_can_add_me_to_groups": "everyone",   # alias
-        "group_invitations": "allow",             # "allow", "review", "block"
-        "allow_invite_links": True,               # boolean
-        "member_approval_by_default": False,      # boolean
-        "admin_controls_preset": "admins",        # "admins", "all_members"
-        "group_info_visibility": "everyone",      # "everyone", "contacts", "nobody"
-        "show_groups_on_profile": True,           # boolean
+        "who_can_add_to_groups": "everyone",
+        "who_can_add_me_to_groups": "everyone",
+        "groups_except": [],
+        "group_invitations": "allow",
+        "allow_invite_links": True,
+        "member_approval_by_default": False,
+        "member_approval": False,
+        "admin_controls_preset": "admins",
+        "admin_permissions": {
+            "edit_group_info": True,
+            "send_messages": True,
+            "add_other_members": True,
+            "pin_messages": True,
+        },
+        "edit_group_info": True,
+        "send_messages": True,
+        "add_other_members": True,
+        "pin_messages": True,
+        "group_info_visibility": "everyone",
+        "show_groups_on_profile": True,
     },
     "exi_card": {
         "theme": "classic",  # "classic", "dark", "neon", "obsidian", "emerald", "gold"
@@ -1514,6 +1551,36 @@ def export_user_chat_history(user, chat_id=None):
 # CALL SETTINGS FLOW (Call Settings, Video Call Settings, Call Management)
 # ===========================================================================
 
+def _to_b(val, default=False):
+    if val is None:
+        return default
+    if isinstance(val, dict):
+        val = val.get("enabled", val.get("value"))
+    if isinstance(val, bool):
+        return val
+    v = str(val).lower().strip()
+    if v in ("true", "1", "yes", "on", "t"):
+        return True
+    if v in ("false", "0", "no", "off", "f"):
+        return False
+    return default
+
+
+def normalize_video_quality(val, default="auto"):
+    if not val:
+        return default
+    v = str(val).lower().strip().replace("-", "_").replace(" ", "_")
+    if "auto" in v or "recommend" in v or "recommed" in v:
+        return "auto"
+    if "1080" in v or "full_hd" in v or v == "high":
+        return "1080p"
+    if "720" in v or "hd" in v or v == "medium":
+        return "720p"
+    if "480" in v or "data_saver" in v or "saver" in v or v in ("low", "360p"):
+        return "480p"
+    return default
+
+
 VALID_CALL_VISIBILITY_OPTIONS = [
     {
         "value": "everyone",
@@ -1535,8 +1602,8 @@ VALID_CALL_VISIBILITY_OPTIONS = [
 VALID_VIDEO_QUALITY_OPTIONS = [
     {
         "value": "auto",
-        "label": "Auto",
-        "description": "Automatically adjusts video quality based on network conditions (Recommended).",
+        "label": "Auto (Recommended)",
+        "description": "Automatically adjusts video quality based on network conditions.",
     },
     {
         "value": "1080p",
@@ -1550,12 +1617,7 @@ VALID_VIDEO_QUALITY_OPTIONS = [
     },
     {
         "value": "480p",
-        "label": "SD (480p)",
-        "description": "Standard definition video, balanced bandwidth and quality.",
-    },
-    {
-        "value": "360p",
-        "label": "Data Saver (360p)",
+        "label": "Data Saver (480p)",
         "description": "Low-resolution video optimized to save mobile data.",
     },
 ]
@@ -1591,16 +1653,14 @@ def get_call_settings_flow(user):
     }
 
     # 2. Video Call Settings
-    video_quality = calls_prefs.get("video_quality", "auto")
-    if video_quality not in ("auto", "1080p", "720p", "480p", "360p"):
-        video_quality = "auto"
+    video_quality = normalize_video_quality(calls_prefs.get("video_quality", "auto"))
 
-    low_data_mode = bool(calls_prefs.get("low_data_mode", storage_prefs.get("low_data_usage_calls", False)))
-    mirror_my_video = bool(calls_prefs.get("mirror_my_video", True))
+    low_data_mode = _to_b(calls_prefs.get("low_data_mode", storage_prefs.get("low_data_usage_calls", False)))
+    mirror_my_video = _to_b(calls_prefs.get("mirror_my_video", True), default=True)
 
     # 3. Call Management
-    call_waiting = bool(calls_prefs.get("call_waiting", True))
-    silence_unknown_callers = bool(calls_prefs.get("silence_unknown_callers", False))
+    call_waiting = _to_b(calls_prefs.get("call_waiting", True), default=True)
+    silence_unknown_callers = _to_b(calls_prefs.get("silence_unknown_callers", False), default=False)
 
     # Legacy notification fields
     call_alerts = bool(notif_prefs.get("call_alerts", True))
@@ -1616,21 +1676,28 @@ def get_call_settings_flow(user):
                 "value": who_can_call,
                 "label": label_map.get(who_can_call, "Everyone"),
                 "options": VALID_CALL_VISIBILITY_OPTIONS,
+                "labels": label_map,
             },
         },
         "video_call_settings": {
             "title": "Video Call Settings",
             "video_quality": {
                 "value": video_quality,
-                "label": next((opt["label"] for opt in VALID_VIDEO_QUALITY_OPTIONS if opt["value"] == video_quality), "Auto"),
+                "label": next((opt["label"] for opt in VALID_VIDEO_QUALITY_OPTIONS if opt["value"] == video_quality), "Auto (Recommended)"),
                 "options": VALID_VIDEO_QUALITY_OPTIONS,
             },
             "low_data_mode": {
                 "value": low_data_mode,
+                "status": "on" if low_data_mode else "off",
+                "options": ["on", "off"],
+                "labels": {"on": "On", "off": "Off"},
                 "description": "Use less data during voice and video calls.",
             },
             "mirror_my_video": {
                 "value": mirror_my_video,
+                "status": "on" if mirror_my_video else "off",
+                "options": ["on", "off"],
+                "labels": {"on": "On", "off": "Off"},
                 "description": "Show yourself as your front camera sees you (mirrored).",
             },
         },
@@ -1638,10 +1705,16 @@ def get_call_settings_flow(user):
             "title": "Call Management",
             "call_waiting": {
                 "value": call_waiting,
+                "status": "on" if call_waiting else "off",
+                "options": ["on", "off"],
+                "labels": {"on": "On", "off": "Off"},
                 "description": "Receive notification of incoming calls while on another call.",
             },
             "silence_unknown_callers": {
                 "value": silence_unknown_callers,
+                "status": "on" if silence_unknown_callers else "off",
+                "options": ["on", "off"],
+                "labels": {"on": "On", "off": "Off"},
                 "description": "Calls from unknown numbers will be silenced. They will still be shown in the Calls tab.",
             },
         },
@@ -1695,7 +1768,15 @@ def update_call_settings_flow(user, data):
 
     who_val = _extract_scalar(who_raw)
     if who_val is not None:
-        who_val = str(who_val).lower().strip()
+        who_str = str(who_val).lower().strip().replace(" ", "_")
+        if who_str in ("my_contacts", "contacts"):
+            who_val = "contacts"
+        elif who_str in ("nobody", "none"):
+            who_val = "nobody"
+        elif who_str in ("everyone", "all", "anyone"):
+            who_val = "everyone"
+        else:
+            who_val = who_str
         if who_val in ("everyone", "contacts", "nobody"):
             calls_prefs["who_can_call"] = who_val
             calls_prefs["allow_calls_from"] = who_val
@@ -1710,9 +1791,7 @@ def update_call_settings_flow(user, data):
     vq_raw = data.get("video_quality") if "video_quality" in data else video_data.get("video_quality")
     vq = _extract_scalar(vq_raw)
     if vq is not None:
-        vq = str(vq).lower().strip()
-        if vq in ("auto", "1080p", "720p", "480p", "360p"):
-            calls_prefs["video_quality"] = vq
+        calls_prefs["video_quality"] = normalize_video_quality(vq)
 
     ldm_raw = None
     if "low_data_mode" in data:
@@ -1724,7 +1803,7 @@ def update_call_settings_flow(user, data):
 
     ldm = _extract_scalar(ldm_raw)
     if ldm is not None:
-        ldm_bool = str(ldm).lower() in ("true", "1") if not isinstance(ldm, bool) else ldm
+        ldm_bool = _to_b(ldm)
         calls_prefs["low_data_mode"] = ldm_bool
         storage_prefs["low_data_usage_calls"] = ldm_bool
 
@@ -1734,7 +1813,7 @@ def update_call_settings_flow(user, data):
 
     mmv = _extract_scalar(mmv_raw)
     if mmv is not None:
-        mmv_bool = str(mmv).lower() in ("true", "1") if not isinstance(mmv, bool) else mmv
+        mmv_bool = _to_b(mmv)
         calls_prefs["mirror_my_video"] = mmv_bool
 
     # 3. Call Management
@@ -1743,13 +1822,13 @@ def update_call_settings_flow(user, data):
     cw_raw = data.get("call_waiting") if "call_waiting" in data else mgmt_data.get("call_waiting")
     cw = _extract_scalar(cw_raw)
     if cw is not None:
-        cw_bool = str(cw).lower() in ("true", "1") if not isinstance(cw, bool) else cw
+        cw_bool = _to_b(cw)
         calls_prefs["call_waiting"] = cw_bool
 
     suk_raw = data.get("silence_unknown_callers") if "silence_unknown_callers" in data else mgmt_data.get("silence_unknown_callers")
     suk = _extract_scalar(suk_raw)
     if suk is not None:
-        suk_bool = str(suk).lower() in ("true", "1") if not isinstance(suk, bool) else suk
+        suk_bool = _to_b(suk)
         calls_prefs["silence_unknown_callers"] = suk_bool
         security_prefs["silence_unknown_callers"] = suk_bool
 
@@ -2392,14 +2471,19 @@ def update_security_flow_data(user, data, request=None):
 # GROUP SETTINGS FLOW & PRIVACY MANAGEMENT
 # ==============================================================================
 
-def _to_b(val):
+def _to_b_bool(val, default=False):
     if val is None:
-        return False
+        return default
     if isinstance(val, dict):
         val = val.get("enabled", val.get("value"))
     if isinstance(val, bool):
         return val
-    return str(val).lower().strip() in ("true", "1", "yes", "on")
+    v = str(val).lower().strip()
+    if v in ("true", "1", "yes", "on", "t"):
+        return True
+    if v in ("false", "0", "no", "off", "f"):
+        return False
+    return default
 
 
 INVITATIONS_DIR = os.path.join(settings.BASE_DIR, 'data', 'group_invitations')
@@ -2577,10 +2661,22 @@ def can_user_add_to_group(adder, target_user):
     )
     who = str(who).lower().strip() if who else "everyone"
 
+    if who in ("my_contacts_except", "contacts_except", "except"):
+        who = "contacts_except"
+
     if who == "everyone":
         return True, None
     elif who == "nobody":
         return False, f"{target_user.username}'s privacy settings do not allow anyone to add them to groups directly."
+    elif who in ("contacts_except", "my_contacts_except"):
+        from accounts.utils import are_contacts
+        if not are_contacts(target_user, adder):
+            return False, f"{target_user.username}'s privacy settings only allow contacts to add them to groups."
+        groups_except = g_prefs.get("groups_except", g_prefs.get("who_can_add_except", p_prefs.get("groups_except", [])))
+        excluded_strs = {str(x).strip() for x in groups_except}
+        if str(adder.id) in excluded_strs or (getattr(adder, 'phone', None) and str(adder.phone) in excluded_strs):
+            return False, f"{target_user.username}'s privacy settings do not allow you to add them to groups."
+        return True, None
     elif who == "contacts":
         from accounts.utils import are_contacts
         if are_contacts(target_user, adder):
@@ -2677,15 +2773,73 @@ def get_user_recent_groups(user, request=None, search=None, role=None, limit=20)
     return groups_data
 
 
+VALID_GROUP_INVITATION_OPTIONS = [
+    {
+        "value": "require_approval",
+        "label": "Require approval",
+        "description": "Every invite waits for your yes",
+        "alias": "review",
+    },
+    {
+        "value": "direct_invitations_only",
+        "label": "Direct invitations only",
+        "description": "Only people who invite you by name",
+        "alias": "block",
+    },
+    {
+        "value": "open_invitation_links_allowed",
+        "label": "Open invitation links allowed",
+        "description": "Anyone with a link can add you",
+        "alias": "allow",
+    },
+]
+
+VALID_GROUP_INFO_VISIBILITY_OPTIONS = [
+    {
+        "value": "everyone",
+        "label": "Everyone",
+        "description": "Anyone on Exi",
+    },
+    {
+        "value": "contacts",
+        "label": "My Contacts",
+        "description": "People in your address book",
+    },
+    {
+        "value": "nobody",
+        "label": "Nobody",
+        "description": "Hidden from everyone",
+    },
+]
+
+VALID_WHO_CAN_ADD_OPTIONS = [
+    {
+        "value": "everyone",
+        "label": "Everyone",
+        "description": "Anyone on Exi can add you directly to groups",
+    },
+    {
+        "value": "contacts",
+        "label": "My Contacts",
+        "description": "People in your address book can add you directly to groups",
+    },
+    {
+        "value": "nobody",
+        "label": "Nobody",
+        "description": "Nobody can add you directly; they must send an invitation",
+    },
+]
+
+
 def get_group_settings_flow(user, request=None):
     """
-    Returns complete Group Settings backend flow:
+    Returns complete Group Settings backend flow matching UI screens:
     1. Who can add me to groups: Everyone / My Contacts / Nobody
     2. Group Privacy:
-       - Group Invitations
-       - Member Approval
-       - Admin Controls
-       - Group Info Visibility
+       - Group Invitations (Require approval / Direct invitations only / Open invitation links allowed)
+       - Member Approval (switch on/off: Admins must approve new members)
+       - Admin Controls / Permissions (Edit Group Info, Send Messages, Add Other Members, Pin Messages)
+       - Group Info Visibility (Everyone / My Contacts / Nobody)
        - Recent Groups
     """
     g_prefs = get_section_preferences(user.id, "group_settings") or {}
@@ -2698,18 +2852,30 @@ def get_group_settings_flow(user, request=None):
             p_prefs.get("groups", p_prefs.get("add_to_groups", "everyone"))
         )
     )
-    if who not in ("everyone", "contacts", "nobody"):
+    who_str = str(who).lower().strip() if who else "everyone"
+    if who_str in ("my_contacts_except", "contacts_except", "except"):
+        who = "contacts_except"
+    elif who_str in ("my_contacts", "contacts"):
+        who = "contacts"
+    elif who_str in ("nobody", "none"):
+        who = "nobody"
+    else:
         who = "everyone"
+
+    groups_except = g_prefs.get("groups_except", g_prefs.get("who_can_add_except", p_prefs.get("groups_except", [])))
 
     invitations_mode = g_prefs.get(
         "group_invitations",
         p_prefs.get("group_invitations", "allow")
     )
-    if invitations_mode not in ("allow", "review", "block"):
+    if invitations_mode not in ("allow", "review", "block", "require_approval", "direct_invitations_only", "open_invitation_links_allowed"):
         invitations_mode = "allow"
 
-    allow_invite_links = _to_b(g_prefs.get("allow_invite_links", True))
-    member_approval_by_default = _to_b(g_prefs.get("member_approval_by_default", False))
+    allow_invite_links = _to_b_bool(g_prefs.get("allow_invite_links", True))
+    member_approval_by_default = _to_b_bool(
+        g_prefs.get("member_approval_by_default", g_prefs.get("member_approval", False)),
+        default=False
+    )
     admin_preset = g_prefs.get("admin_controls_preset", "admins")
     if admin_preset not in ("admins", "all_members"):
         admin_preset = "admins"
@@ -2718,7 +2884,7 @@ def get_group_settings_flow(user, request=None):
     if info_vis not in ("everyone", "contacts", "nobody"):
         info_vis = "everyone"
 
-    show_profile = _to_b(g_prefs.get("show_groups_on_profile", True))
+    show_profile = _to_b_bool(g_prefs.get("show_groups_on_profile", True))
 
     invitations = get_user_group_invitations(user.id, status_filter="pending")
     recent_groups = get_user_recent_groups(user, request=request, limit=5)
@@ -2726,13 +2892,17 @@ def get_group_settings_flow(user, request=None):
     who_labels = {
         "everyone": "Everyone",
         "contacts": "My Contacts",
+        "contacts_except": "My contacts except",
         "nobody": "Nobody"
     }
 
     invitation_labels = {
-        "allow": "Allow Invitations",
-        "review": "Review Before Joining",
-        "block": "Block Invitations"
+        "allow": "Open invitation links allowed",
+        "open_invitation_links_allowed": "Open invitation links allowed",
+        "review": "Require approval",
+        "require_approval": "Require approval",
+        "block": "Direct invitations only",
+        "direct_invitations_only": "Direct invitations only",
     }
 
     preset_labels = {
@@ -2740,57 +2910,178 @@ def get_group_settings_flow(user, request=None):
         "all_members": "All Members"
     }
 
+    info_vis_labels = {
+        "everyone": "Everyone",
+        "contacts": "My Contacts",
+        "nobody": "Nobody"
+    }
+
+    # 4 Granular Admin Permissions from UI screenshot
+    admin_perms = g_prefs.get("admin_permissions") or {}
+    edit_group_info = _to_b_bool(admin_perms.get("edit_group_info", g_prefs.get("edit_group_info", True)), default=True)
+    send_messages = _to_b_bool(admin_perms.get("send_messages", g_prefs.get("send_messages", True)), default=True)
+    add_other_members = _to_b_bool(admin_perms.get("add_other_members", admin_perms.get("add_members", g_prefs.get("add_other_members", True))), default=True)
+    pin_messages = _to_b_bool(admin_perms.get("pin_messages", g_prefs.get("pin_messages", True)), default=True)
+
+    active_perms = [edit_group_info, send_messages, add_other_members, pin_messages]
+    active_count = sum(1 for p in active_perms if p)
+    status_label = "All permissions on" if active_count == 4 else f"{active_count} of 4 permissions on" if active_count > 0 else "All permissions off"
+
+    admin_controls_data = {
+        "title": "Admin Controls",
+        "sheet_title": "Admin Permissions",
+        "subtitle": status_label,
+        "status_label": status_label,
+        "description": "Choose the default permissions group administrators hold.",
+        "permissions": {
+            "edit_group_info": {
+                "key": "edit_group_info",
+                "label": "Edit Group Info",
+                "description": "Change subject, icon, and description",
+                "value": edit_group_info,
+                "status": "on" if edit_group_info else "off",
+                "options": ["on", "off"],
+            },
+            "send_messages": {
+                "key": "send_messages",
+                "label": "Send Messages",
+                "description": "Allow posting into announcement-only groups",
+                "value": send_messages,
+                "status": "on" if send_messages else "off",
+                "options": ["on", "off"],
+            },
+            "add_other_members": {
+                "key": "add_other_members",
+                "label": "Add Other Members",
+                "description": "Invite and add new contacts",
+                "value": add_other_members,
+                "status": "on" if add_other_members else "off",
+                "options": ["on", "off"],
+            },
+            "pin_messages": {
+                "key": "pin_messages",
+                "label": "Pin Messages",
+                "description": "Highlight critical updates to the header",
+                "value": pin_messages,
+                "status": "on" if pin_messages else "off",
+                "options": ["on", "off"],
+            },
+        },
+        "permissions_list": [
+            {
+                "key": "edit_group_info",
+                "label": "Edit Group Info",
+                "description": "Change subject, icon, and description",
+                "value": edit_group_info,
+                "status": "on" if edit_group_info else "off",
+            },
+            {
+                "key": "send_messages",
+                "label": "Send Messages",
+                "description": "Allow posting into announcement-only groups",
+                "value": send_messages,
+                "status": "on" if send_messages else "off",
+            },
+            {
+                "key": "add_other_members",
+                "label": "Add Other Members",
+                "description": "Invite and add new contacts",
+                "value": add_other_members,
+                "status": "on" if add_other_members else "off",
+            },
+            {
+                "key": "pin_messages",
+                "label": "Pin Messages",
+                "description": "Highlight critical updates to the header",
+                "value": pin_messages,
+                "status": "on" if pin_messages else "off",
+            },
+        ],
+        "edit_group_info": edit_group_info,
+        "send_messages": send_messages,
+        "add_other_members": add_other_members,
+        "add_members": add_other_members,
+        "pin_messages": pin_messages,
+        # Backward compatibility
+        "default_preset": admin_preset,
+        "options": ["admins", "all_members"],
+        "labels": preset_labels,
+        "selected_label": preset_labels.get(admin_preset, admin_preset.title()),
+        "permissions_preview": {
+            "edit_group_info": "admins" if admin_preset == "admins" else "everyone",
+            "send_messages": "everyone",
+            "send_media": "everyone",
+            "add_members": "admins" if admin_preset == "admins" else "everyone",
+            "pin_messages": "admins" if admin_preset == "admins" else "everyone",
+            "remove_members": "admins",
+            "approve_requests": "admins",
+            "manage_admins": "admins",
+        },
+        "permissions_matrix": [
+            {"permission": "Edit group information", "admin": "Yes", "member": "Based on permission" if admin_preset == "admins" else "Yes"},
+            {"permission": "Add members", "admin": "Configurable", "member": "Configurable"},
+            {"permission": "Remove members", "admin": "Yes", "member": "No"},
+            {"permission": "Approve requests", "admin": "Yes", "member": "No"},
+            {"permission": "Send messages", "admin": "Yes", "member": "Yes"},
+            {"permission": "Manage admins", "admin": "Yes, subject to role hierarchy", "member": "No"},
+        ],
+    }
+
+    selected_inv_label = invitation_labels.get(invitations_mode, "Require approval")
+
     return {
         "title": "Group Settings",
         "who_can_add_me_to_groups": {
             "title": "Who can add me to groups",
             "value": who,
-            "options": ["everyone", "contacts", "nobody"],
+            "options": ["everyone", "contacts", "contacts_except", "nobody"],
+            "ui_options": ["everyone", "contacts", "nobody"],
+            "options_detailed": VALID_WHO_CAN_ADD_OPTIONS,
             "labels": who_labels,
-            "selected_label": who_labels.get(who, who.title()),
+            "selected_label": who_labels.get(who, "Everyone"),
+            "excluded_contacts": groups_except,
+            "excluded_contacts_count": len(groups_except),
             "description": "Choose who can add you directly to group chats without sending an invitation."
         },
         "group_privacy": {
             "title": "Group Privacy",
             "group_invitations": {
                 "title": "Group Invitations",
+                "sheet_title": "Group Invitations",
+                "subtitle": selected_inv_label,
+                "selected_label": selected_inv_label,
                 "value": invitations_mode,
                 "allow_invite_links": allow_invite_links,
                 "options": ["allow", "review", "block"],
+                "ui_options": ["require_approval", "direct_invitations_only", "open_invitation_links_allowed"],
+                "options_detailed": VALID_GROUP_INVITATION_OPTIONS,
                 "labels": invitation_labels,
-                "selected_label": invitation_labels.get(invitations_mode, invitations_mode.title()),
                 "pending_count": len(invitations),
                 "action_url": "/api/groups/invitations/",
-                "description": "Manage how you receive and process group invitations."
+                "description": "How people may invite you into a group."
             },
             "member_approval": {
                 "title": "Member Approval",
+                "subtitle": "Admins must approve new members",
+                "description": "Admins must approve new members",
+                "value": member_approval_by_default,
+                "status": "on" if member_approval_by_default else "off",
                 "require_approval_by_default": member_approval_by_default,
-                "description": "When turned on, new members require admin approval before joining groups you create."
+                "options": ["on", "off"],
+                "labels": {"on": "On", "off": "Off"},
             },
-            "admin_controls": {
-                "title": "Admin Controls",
-                "default_preset": admin_preset,
-                "options": ["admins", "all_members"],
-                "labels": preset_labels,
-                "selected_label": preset_labels.get(admin_preset, admin_preset.title()),
-                "permissions_preview": {
-                    "edit_group_info": "admins" if admin_preset == "admins" else "everyone",
-                    "send_messages": "everyone",
-                    "send_media": "everyone",
-                    "add_members": "admins" if admin_preset == "admins" else "everyone",
-                    "pin_messages": "admins" if admin_preset == "admins" else "everyone",
-                },
-                "description": "Default permission presets applied to groups you manage."
-            },
+            "admin_controls": admin_controls_data,
             "group_info_visibility": {
                 "title": "Group Info Visibility",
+                "sheet_title": "Group Info Visibility",
+                "subtitle": info_vis_labels.get(info_vis, "My Contacts"),
+                "description": "Who can see the groups you belong to.",
                 "value": info_vis,
-                "show_groups_on_profile": show_profile,
+                "selected_label": info_vis_labels.get(info_vis, "My Contacts"),
                 "options": ["everyone", "contacts", "nobody"],
-                "labels": who_labels,
-                "selected_label": who_labels.get(info_vis, info_vis.title()),
-                "description": "Control who can view your group memberships on your public profile."
+                "options_detailed": VALID_GROUP_INFO_VISIBILITY_OPTIONS,
+                "labels": info_vis_labels,
+                "show_groups_on_profile": show_profile,
             },
             "recent_groups": {
                 "title": "Recent Groups",
@@ -2799,7 +3090,13 @@ def get_group_settings_flow(user, request=None):
                 "action_url": "/api/groups/recent/",
                 "description": "Your recently active group conversations and memberships."
             }
-        }
+        },
+        # Top-level helper fields for direct frontend binding
+        "admin_permissions": admin_controls_data["permissions"],
+        "edit_group_info": edit_group_info,
+        "send_messages": send_messages,
+        "add_other_members": add_other_members,
+        "pin_messages": pin_messages,
     }
 
 
@@ -2816,6 +3113,7 @@ def update_group_settings_flow(user, data, request=None):
 
     # 1. Who can add me to groups
     who_raw = None
+    exc_raw = None
     if "who_can_add_me_to_groups" in data:
         who_raw = data["who_can_add_me_to_groups"]
     elif "who_can_add_to_groups" in data:
@@ -2825,14 +3123,38 @@ def update_group_settings_flow(user, data, request=None):
     elif "add_to_groups" in data:
         who_raw = data["add_to_groups"]
 
+    if isinstance(who_raw, dict):
+        exc_raw = who_raw.get("excluded_contacts") or who_raw.get("except")
+        who_raw = who_raw.get("value")
+
+    if exc_raw is None:
+        exc_raw = data.get("groups_except") or data.get("who_can_add_except") or data.get("excluded_contacts")
+
     who_val = _extract_scalar(who_raw)
     if who_val is not None:
-        who_val = str(who_val).lower().strip()
-        if who_val in ("everyone", "contacts", "nobody"):
-            g_prefs["who_can_add_to_groups"] = who_val
-            g_prefs["who_can_add_me_to_groups"] = who_val
-            p_prefs["groups"] = who_val
-            p_prefs["add_to_groups"] = who_val
+        who_str = str(who_val).lower().strip().replace(" ", "_").replace("-", "_")
+        if who_str in ("my_contacts_except", "contacts_except", "except"):
+            norm_who = "contacts_except"
+        elif who_str in ("my_contacts", "contacts", "people_in_your_address_book"):
+            norm_who = "contacts"
+        elif who_str in ("nobody", "none", "hidden_from_everyone"):
+            norm_who = "nobody"
+        elif who_str in ("everyone", "anyone", "all", "anyone_on_exi"):
+            norm_who = "everyone"
+        else:
+            norm_who = who_str
+
+        if norm_who in ("everyone", "contacts", "contacts_except", "nobody"):
+            g_prefs["who_can_add_to_groups"] = norm_who
+            g_prefs["who_can_add_me_to_groups"] = norm_who
+            p_prefs["groups"] = norm_who
+            p_prefs["add_to_groups"] = norm_who
+
+    if exc_raw is not None and isinstance(exc_raw, list):
+        g_prefs["groups_except"] = exc_raw
+        g_prefs["who_can_add_except"] = exc_raw
+        p_prefs["groups_except"] = exc_raw
+        p_prefs["groups_excluded_contacts"] = exc_raw
 
     # Group privacy sub-dict handling
     gp_data = data.get("group_privacy") if isinstance(data.get("group_privacy"), dict) else {}
@@ -2848,42 +3170,79 @@ def update_group_settings_flow(user, data, request=None):
             inv_raw = inv_raw["value"]
     inv_val = _extract_scalar(inv_raw)
     if inv_val is not None:
-        inv_val = str(inv_val).lower().strip()
-        if inv_val in ("allow", "review", "block"):
-            g_prefs["group_invitations"] = inv_val
-            p_prefs["group_invitations"] = inv_val
+        inv_str = str(inv_val).lower().strip().replace(" ", "_").replace("-", "_")
+        if inv_str in ("require_approval", "review", "approval", "every_invite_waits_for_your_yes"):
+            norm_inv = "require_approval" if "require" in inv_str else inv_str
+        elif inv_str in ("direct_invitations_only", "direct_only", "direct", "block", "only_people_who_invite_you_by_name"):
+            norm_inv = "direct_invitations_only" if "direct" in inv_str else inv_str
+        elif inv_str in ("open_invitation_links_allowed", "links_allowed", "links", "allow", "anyone_with_a_link_can_add_you"):
+            norm_inv = "open_invitation_links_allowed" if "open" in inv_str else inv_str
+        else:
+            norm_inv = inv_str
+        g_prefs["group_invitations"] = norm_inv
+        p_prefs["group_invitations"] = norm_inv
 
     ail_raw = data.get("allow_invite_links", gp_data.get("allow_invite_links"))
     if ail_raw is not None:
-        g_prefs["allow_invite_links"] = _to_b(ail_raw)
+        g_prefs["allow_invite_links"] = _to_b_bool(ail_raw)
 
     # 3. Member Approval
     ma_raw = None
-    if "member_approval_by_default" in data:
+    if "member_approval" in data:
+        ma_raw = data["member_approval"]
+    elif "member_approval_by_default" in data:
         ma_raw = data["member_approval_by_default"]
     elif "require_approval_by_default" in data:
         ma_raw = data["require_approval_by_default"]
     elif "member_approval" in gp_data:
-        ma_val = gp_data["member_approval"]
-        if isinstance(ma_val, dict):
-            ma_raw = ma_val.get("require_approval_by_default")
-        else:
-            ma_raw = ma_val
+        ma_raw = gp_data["member_approval"]
+    if isinstance(ma_raw, dict):
+        ma_raw = ma_raw.get("value", ma_raw.get("require_approval_by_default", ma_raw.get("status")))
     if ma_raw is not None:
-        g_prefs["member_approval_by_default"] = _to_b(ma_raw)
+        ma_bool = _to_b_bool(ma_raw)
+        g_prefs["member_approval_by_default"] = ma_bool
+        g_prefs["member_approval"] = ma_bool
 
-    # 4. Admin Controls Preset
+    # 4. Admin Controls & Granular Admin Permissions
+    ac_data = data.get("admin_controls") if isinstance(data.get("admin_controls"), dict) else {}
+    ap_data = data.get("admin_permissions") if isinstance(data.get("admin_permissions"), dict) else {}
+    gp_ac = gp_data.get("admin_controls") if isinstance(gp_data.get("admin_controls"), dict) else {}
+    gp_ap = gp_data.get("admin_permissions") if isinstance(gp_data.get("admin_permissions"), dict) else {}
+
+    admin_perms = g_prefs.get("admin_permissions") or {}
+    for perm_key in ("edit_group_info", "send_messages", "add_other_members", "pin_messages"):
+        val = None
+        for source in (data, ac_data, ap_data, gp_data, gp_ac, gp_ap):
+            if perm_key in source:
+                val = source[perm_key]
+                break
+            if perm_key == "add_other_members" and "add_members" in source:
+                val = source["add_members"]
+                break
+        if val is not None:
+            if isinstance(val, dict):
+                val = val.get("value", val.get("status"))
+            b_val = _to_b_bool(val)
+            admin_perms[perm_key] = b_val
+            g_prefs[perm_key] = b_val
+            if perm_key == "add_other_members":
+                admin_perms["add_members"] = b_val
+                g_prefs["add_members"] = b_val
+
+    g_prefs["admin_permissions"] = admin_perms
+
     ac_raw = None
     if "admin_controls_preset" in data:
         ac_raw = data["admin_controls_preset"]
     elif "default_preset" in data:
         ac_raw = data["default_preset"]
-    elif "admin_controls" in gp_data:
-        ac_val = gp_data["admin_controls"]
-        if isinstance(ac_val, dict):
-            ac_raw = ac_val.get("default_preset")
-        else:
-            ac_raw = ac_val
+    elif "default_preset" in ac_data:
+        ac_raw = ac_data["default_preset"]
+    elif "admin_controls_preset" in ac_data:
+        ac_raw = ac_data["admin_controls_preset"]
+    elif "default_preset" in gp_ac:
+        ac_raw = gp_ac["default_preset"]
+
     ac_val = _extract_scalar(ac_raw)
     if ac_val is not None:
         ac_val = str(ac_val).lower().strip()
@@ -2895,20 +3254,26 @@ def update_group_settings_flow(user, data, request=None):
     if "group_info_visibility" in data:
         giv_raw = data["group_info_visibility"]
     elif "group_info_visibility" in gp_data:
-        giv_val = gp_data["group_info_visibility"]
-        if isinstance(giv_val, dict):
-            giv_raw = giv_val.get("value")
-        else:
-            giv_raw = giv_val
+        giv_raw = gp_data["group_info_visibility"]
+    if isinstance(giv_raw, dict):
+        giv_raw = giv_raw.get("value")
     giv_val = _extract_scalar(giv_raw)
     if giv_val is not None:
-        giv_val = str(giv_val).lower().strip()
-        if giv_val in ("everyone", "contacts", "nobody"):
-            g_prefs["group_info_visibility"] = giv_val
+        giv_str = str(giv_val).lower().strip().replace(" ", "_").replace("-", "_")
+        if giv_str in ("my_contacts", "contacts", "people_in_your_address_book"):
+            norm_giv = "contacts"
+        elif giv_str in ("nobody", "none", "hidden_from_everyone"):
+            norm_giv = "nobody"
+        elif giv_str in ("everyone", "anyone", "all", "anyone_on_exi"):
+            norm_giv = "everyone"
+        else:
+            norm_giv = giv_str
+        if norm_giv in ("everyone", "contacts", "nobody"):
+            g_prefs["group_info_visibility"] = norm_giv
 
     sgp_raw = data.get("show_groups_on_profile", gp_data.get("show_groups_on_profile"))
     if sgp_raw is not None:
-        g_prefs["show_groups_on_profile"] = _to_b(sgp_raw)
+        g_prefs["show_groups_on_profile"] = _to_b_bool(sgp_raw)
 
     update_section_preferences(user.id, "group_settings", g_prefs)
     update_section_preferences(user.id, "privacy", p_prefs)

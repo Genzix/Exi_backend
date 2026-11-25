@@ -90,6 +90,16 @@ class LoginView(APIView):
 
 
 class LogoutView(APIView):
+    """
+    POST /api/auth/logout/
+    POST /api/account/logout/
+    POST /api/logout/
+    Logs out the current user session:
+    - Sets user offline (user.set_offline())
+    - Deactivates device session if device_id provided
+    - Revokes all sessions if all_devices=true
+    - Blacklists refresh token if passed
+    """
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
@@ -101,6 +111,21 @@ class LogoutView(APIView):
                 user=request.user,
                 device_id=device_id,
             ).update(is_active=False, push_token='')
+
+        if request.data.get('all_devices') or request.data.get('revoke_all'):
+            request.user.revoke_all_sessions()
+            from .models import UserDevice
+            UserDevice.objects.filter(user=request.user).update(is_active=False, push_token='')
+
+        refresh_token = request.data.get('refresh') or request.data.get('refresh_token')
+        if refresh_token:
+            try:
+                from rest_framework_simplejwt.tokens import RefreshToken
+                token = RefreshToken(refresh_token)
+                token.blacklist()
+            except Exception:
+                pass
+
         return Response({"detail": "Logged out successfully."})
 
 
@@ -579,6 +604,14 @@ class DeactivateAccountView(APIView):
 
 
 class DeleteAccountView(APIView):
+    """
+    DELETE /api/security/delete-account/
+    DELETE /api/account/delete/
+    POST   /api/security/delete-account/
+    POST   /api/account/delete/
+    Permanently deletes user account, devices, and associated preferences.
+    Requires password confirmation and confirmation: "DELETE".
+    """
     permission_classes = [permissions.IsAuthenticated]
 
     def delete(self, request):
@@ -586,12 +619,29 @@ class DeleteAccountView(APIView):
         serializer.is_valid(raise_exception=True)
 
         user = request.user
+        uid = user.id
         user.revoke_all_sessions()
         UserDevice.objects.filter(user=user).delete()
         BlockedUser.objects.filter(blocker=user).delete()
         BlockedUser.objects.filter(blocked=user).delete()
+
+        # Clean up user preferences file if exists
+        try:
+            import os
+            from .user_preferences import PREFS_DIR
+            prefs_file = os.path.join(PREFS_DIR, f"{uid}.json")
+            if os.path.exists(prefs_file):
+                os.remove(prefs_file)
+        except Exception:
+            pass
+
         user.delete()
+        if request.method == "POST":
+            return Response({"detail": "Account deleted permanently."}, status=status.HTTP_200_OK)
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+    def post(self, request):
+        return self.delete(request)
 
 
 # ---------- End-to-end encryption key exchange ----------
@@ -1177,11 +1227,144 @@ from .utils import (
 
 
 # ==========================================
-# 0. Unified Settings View
+# 0. Unified Settings View & Exi Settings Hub
 # ==========================================
 
+class ExiSettingsHubView(APIView):
+    """
+    GET /api/settings/hub/
+    GET /api/settings/exi/
+
+    The Master Exi Settings Hub returning the 7 navigation screens and their configurations:
+    1. Profile & EXI Card: Profile details, EXI ID, bio, and profile visibility
+    2. Chat Settings: Theme, wallpaper, font size, media, message behavior
+    3. Notification Settings: Message alerts, group notifications, calls, and sound effects
+    4. Privacy Settings: Discovery, online status, last seen, message requests, and profile visibility
+    5. Security Settings: App lock, passcode, biometrics, two-step verification, active sessions
+    6. Group Settings: Who can add you, invitations, member approvals, admin permissions
+    7. Call Settings: Call permissions, video quality, call waiting, and unknown callers
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        user_id = user.id
+
+        prefs = get_user_preferences(user_id) or {}
+        notif_prefs = prefs.get("notifications", {})
+        chat_prefs = prefs.get("chats", {})
+        app_prefs = prefs.get("appearance", {})
+        priv_prefs = prefs.get("privacy", {})
+        sec_prefs = prefs.get("security", {})
+        calls_prefs = prefs.get("calls", {})
+        group_prefs = prefs.get("group_settings", {})
+        card_prefs = prefs.get("exi_card", {})
+
+        from .privacy_flow import get_privacy_flow_data
+        from .user_preferences import get_group_settings_flow, get_call_settings_flow
+
+        privacy_flow = get_privacy_flow_data(user)
+        group_flow = get_group_settings_flow(user, request)
+        call_flow = get_call_settings_flow(user)
+
+        # 1. Profile & EXI Card
+        profile_exi_card = {
+            "title": "Profile & EXI Card",
+            "endpoint": "/api/profile/exi-card/",
+            "exi_id": getattr(user, "exi_id", ""),
+            "display_name": getattr(user, "display_name", "") or user.username,
+            "bio": getattr(user, "bio", ""),
+            "avatar_url": user.avatar.url if getattr(user, "avatar", None) else "",
+            "show_exi_id_on_profile": priv_prefs.get("show_exi_id_on_profile", True),
+            "theme": card_prefs.get("theme", "classic"),
+            "badge_title": card_prefs.get("badge_title", "Verified Member"),
+        }
+
+        # 2. Chat Settings
+        chat_settings = {
+            "title": "Chat Settings",
+            "endpoint": "/api/settings/chats/",
+            "theme": app_prefs.get("theme_mode", chat_prefs.get("theme", "system")),
+            "chat_wallpaper": app_prefs.get("wallpaper", chat_prefs.get("chat_wallpaper", {})),
+            "font_size": app_prefs.get("font_size", chat_prefs.get("font_size", "medium")),
+            "show_link_previews": chat_prefs.get("show_link_previews", True),
+            "auto_download_media": chat_prefs.get("auto_download_media", "wifi_only"),
+            "media_quality": chat_prefs.get("media_quality", "standard"),
+            "read_receipts": priv_prefs.get("read_receipts", True),
+            "typing_indicator": priv_prefs.get("typing_indicator", "everyone"),
+            "message_reactions": chat_prefs.get("message_reactions", True),
+        }
+
+        # 3. Notification Settings
+        notification_settings = {
+            "title": "Notification Settings",
+            "endpoint": "/api/settings/notifications/",
+            "message_alerts": bool(notif_prefs.get("message_alerts", True)),
+            "group_notifications": bool(notif_prefs.get("group_notifications", notif_prefs.get("group_alerts", True))),
+            "call_alerts_and_ringing": bool(notif_prefs.get("call_alerts", True)),
+            "in_app_sound_effects": bool(notif_prefs.get("in_app_sound_effects", notif_prefs.get("sounds", True))),
+        }
+
+        # 4. Privacy Settings
+        privacy_settings = {
+            "title": "Privacy Settings",
+            "endpoint": "/api/privacy/flow/",
+            "finding_you": privacy_flow["sections"]["finding_you"],
+            "activity_privacy": privacy_flow["sections"]["activity_privacy"],
+            "profile_privacy": privacy_flow["sections"]["profile_privacy"],
+        }
+
+        # 5. Security Settings
+        security_settings = {
+            "title": "Security Settings",
+            "endpoint": "/api/security/flow/",
+            "app_lock": bool(sec_prefs.get("app_lock", False)),
+            "use_biometrics": bool(sec_prefs.get("use_biometrics", False)),
+            "two_step_verification": bool(sec_prefs.get("two_step_verification", False)),
+            "e2ee_enabled": bool(sec_prefs.get("e2ee_enabled", True)),
+            "security_notifications": bool(sec_prefs.get("security_notifications", True)),
+        }
+
+        # 6. Group Settings
+        group_settings = {
+            "title": "Group Settings",
+            "endpoint": "/api/settings/groups/flow/",
+            "who_can_add_me_to_groups": group_flow["who_can_add_me_to_groups"]["value"],
+            "group_invitations": group_flow["group_privacy"]["group_invitations"]["value"],
+            "member_approval": group_flow["group_privacy"]["member_approval"]["require_approval_by_default"],
+            "admin_controls_preset": group_flow["group_privacy"]["admin_controls"]["default_preset"],
+            "admin_permissions": group_flow["group_privacy"]["admin_controls"]["permissions_matrix"],
+            "group_info_visibility": group_flow["group_privacy"]["group_info_visibility"]["value"],
+        }
+
+        # 7. Call Settings
+        call_settings = {
+            "title": "Call Settings",
+            "endpoint": "/api/settings/calls/",
+            "who_can_call_me": call_flow["call_settings"]["who_can_call"]["value"],
+            "video_quality": call_flow["video_call_settings"]["video_quality"]["value"],
+            "low_data_mode": call_flow["video_call_settings"]["low_data_mode"]["value"],
+            "mirror_my_video": call_flow["video_call_settings"]["mirror_my_video"]["value"],
+            "call_waiting": call_flow["call_management"]["call_waiting"]["value"],
+            "silence_unknown_callers": call_flow["call_management"]["silence_unknown_callers"]["value"],
+        }
+
+        return Response({
+            "hub": "Exi Settings",
+            "sections": {
+                "profile_and_exi_card": profile_exi_card,
+                "chat_settings": chat_settings,
+                "notification_settings": notification_settings,
+                "privacy_settings": privacy_settings,
+                "security_settings": security_settings,
+                "group_settings": group_settings,
+                "call_settings": call_settings,
+            }
+        })
+
+
 class UnifiedSettingsView(APIView):
-    """Get or update all user settings in one call (notifications, chats, appearance, storage, privacy)."""
+    """Get or update all user settings in one call (notifications, chats, appearance, storage, privacy, exi_settings)."""
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
@@ -1191,12 +1374,15 @@ class UnifiedSettingsView(APIView):
 
         from .serializers import PrivacySettingsSerializer
 
+        hub_data = ExiSettingsHubView().get(request).data
+
         return Response({
             "notifications": prefs.get("notifications", {}),
             "chats": prefs.get("chats", {}),
             "appearance": prefs.get("appearance", {}),
             "storage": prefs.get("storage", {}),
             "privacy": PrivacySettingsSerializer(privacy).data,
+            "exi_settings": hub_data["sections"],
         })
 
     def patch(self, request):
@@ -1235,19 +1421,51 @@ class UnifiedSettingsView(APIView):
 class NotificationSettingsView(APIView):
     """
     Manage Notification Settings:
-    - Message Alerts, Group Alerts, Call Alerts
+    - Message Alerts, Group Alerts/Notifications, Call Alerts & Ringing, In-App Sound Effects
     - Sounds, Vibration, Preview, Mute All
     """
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        prefs = get_section_preferences(request.user.id, "notifications")
-        return Response(prefs)
+        prefs = get_section_preferences(request.user.id, "notifications") or {}
+        data = dict(prefs)
+        data["message_alerts"] = bool(prefs.get("message_alerts", True))
+        data["group_notifications"] = bool(prefs.get("group_notifications", prefs.get("group_alerts", True)))
+        data["call_alerts_and_ringing"] = bool(prefs.get("call_alerts", True))
+        data["call_alerts"] = bool(prefs.get("call_alerts", True))
+        data["in_app_sound_effects"] = bool(prefs.get("in_app_sound_effects", prefs.get("sounds", True)))
+        data["notification_controls"] = {
+            "message_alerts": {
+                "value": data["message_alerts"],
+                "description": "Direct-message push notifications"
+            },
+            "group_notifications": {
+                "value": data["group_notifications"],
+                "description": "Group messages and mentions"
+            },
+            "call_alerts_and_ringing": {
+                "value": data["call_alerts_and_ringing"],
+                "description": "Incoming call notifications"
+            },
+            "in_app_sound_effects": {
+                "value": data["in_app_sound_effects"],
+                "description": "Sound events inside the application"
+            },
+        }
+        return Response(data)
 
     def patch(self, request):
-        data = request.data
+        data = dict(request.data)
         if not isinstance(data, dict):
             return Response({"detail": "Invalid data format."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Aliases
+        if "group_notifications" in data:
+            data["group_alerts"] = data["group_notifications"]
+        if "in_app_sound_effects" in data:
+            data["sounds"] = data["in_app_sound_effects"]
+        if "call_alerts_and_ringing" in data:
+            data["call_alerts"] = data["call_alerts_and_ringing"]
 
         # Validation for vibration options
         valid_vibrations = ["default", "short", "long", "off"]
@@ -1315,22 +1533,239 @@ class NotificationMuteView(APIView):
 # 2. Chats Settings
 # ==========================================
 
+WALLPAPER_PRESETS = [
+    {
+        "id": "default_classic",
+        "name": "Default Classic",
+        "color": "#FFFFFF",
+        "preview_color": "#F8FAFC",
+        "text_color": "#0F172A",
+    },
+    {
+        "id": "graphite_dark",
+        "name": "Graphite Dark",
+        "color": "#1E293B",
+        "preview_color": "#0F172A",
+        "text_color": "#FFFFFF",
+    },
+    {
+        "id": "electric_lime",
+        "name": "Electric Lime",
+        "color": "#ECFCCB",
+        "preview_color": "#D9F99D",
+        "text_color": "#1E293B",
+    },
+    {
+        "id": "sky_mist",
+        "name": "Sky Mist",
+        "color": "#E0F2FE",
+        "preview_color": "#BAE6FD",
+        "text_color": "#0F172A",
+    },
+    {
+        "id": "rose_blossom",
+        "name": "Rose Blossom",
+        "color": "#FCE7F3",
+        "preview_color": "#FBCFE8",
+        "text_color": "#0F172A",
+    },
+    {
+        "id": "sage_clean",
+        "name": "Sage Clean",
+        "color": "#DCFCE7",
+        "preview_color": "#D1FAE5",
+        "text_color": "#0F172A",
+    },
+]
+
+THEME_OPTIONS = [
+    {"id": "system", "label": "System", "description": "Follows your phone's appearance setting"},
+    {"id": "light", "label": "Light", "description": "Always the bright palette"},
+    {"id": "dark", "label": "Dark", "description": "Always the graphite palette"},
+]
+
+
 class ChatPreferencesView(APIView):
     """
-    Manage Chat Settings:
-    - Disappearing Messages default timer
-    - Enter to Send
-    - Keep Chats Archived
-    - Auto Backup Frequency
+    Manage Chat Settings matching the 3-section mobile layout:
+    1. Appearance:
+       - Theme: Light / Dark / System
+       - Chat Wallpaper: Presets / custom background palette
+       - Font Size: Small / Medium / Large
+    2. Media & Links:
+       - Show Link Previews: ON / OFF
+       - Auto-download Media: Wi-Fi only / Wifi and cellular / Never
+       - Media Quality: Data saver / Standard / HD quality
+    3. Message Behaviour:
+       - Read Receipts: ON / OFF
+       - Typing Indicator: ON / OFF
+       - Message Reactions: ON / OFF
     """
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        prefs = get_section_preferences(request.user.id, "chats")
-        return Response(prefs)
+        user_id = request.user.id
+        chat_prefs = get_section_preferences(user_id, "chats") or {}
+        app_prefs = get_section_preferences(user_id, "appearance") or {}
+        priv_prefs = get_section_preferences(user_id, "privacy") or {}
+        stor_prefs = get_section_preferences(user_id, "storage") or {}
+
+        from .privacy_flow import _to_bool
+
+        data = dict(chat_prefs)
+        theme = app_prefs.get("theme_mode", chat_prefs.get("theme", "system"))
+        wallpaper = app_prefs.get("wallpaper", chat_prefs.get("chat_wallpaper", {
+            "preset": "default", "url": "", "color": "#0F172A", "blur": 0, "opacity": 1.0,
+        }))
+        font_size = app_prefs.get("font_size", chat_prefs.get("font_size", "medium"))
+        show_link_previews = _to_bool(chat_prefs.get("show_link_previews", True))
+
+        raw_auto_download = chat_prefs.get("auto_download_media", "wifi_only")
+        if str(raw_auto_download).lower().strip() in ("wifi_and_cellular", "cellular", "mobile_data", "wifi and cellular"):
+            auto_download_media = "wifi_and_cellular"
+        elif str(raw_auto_download).lower().strip() in ("never", "none"):
+            auto_download_media = "never"
+        else:
+            auto_download_media = "wifi_only"
+
+        raw_media_quality = chat_prefs.get("media_quality", stor_prefs.get("upload_quality", "standard"))
+        raw_mq_str = str(raw_media_quality).lower().strip()
+        if raw_mq_str in ("data_saver", "data saver", "low"):
+            media_quality = "data_saver"
+        elif raw_mq_str in ("hd_quality", "hd quality"):
+            media_quality = "hd_quality"
+        elif raw_mq_str == "hd":
+            media_quality = "hd"
+        else:
+            media_quality = "standard"
+
+        read_receipts = _to_bool(priv_prefs.get("read_receipts", True))
+
+        typing_raw = priv_prefs.get("typing_indicator", "everyone")
+        typing_indicator_bool = (typing_raw != "nobody" and typing_raw is not False)
+
+        message_reactions = _to_bool(chat_prefs.get("message_reactions", True))
+
+        # Structured controls
+        theme_control = {
+            "value": theme,
+            "options": ["system", "light", "dark"],
+            "labels": {"system": "System", "light": "Light", "dark": "Dark"},
+            "theme_options": THEME_OPTIONS,
+            "description": "Applies to every chat thread on this device.",
+        }
+        wallpaper_control = {
+            "value": wallpaper,
+            "presets": WALLPAPER_PRESETS,
+            "description": "Select a preset background palette for all your chat threads.",
+        }
+        font_size_control = {
+            "value": font_size,
+            "options": ["small", "medium", "large"],
+            "labels": {"small": "Small", "medium": "Medium", "large": "Large"},
+            "description": "Message text font size",
+        }
+        show_link_previews_control = {
+            "value": show_link_previews,
+            "status": "on" if show_link_previews else "off",
+            "options": ["on", "off"],
+            "labels": {"on": "On", "off": "Off"},
+            "description": "Enable or disable link previews",
+        }
+        auto_download_control = {
+            "value": auto_download_media,
+            "options": ["wifi_only", "wifi_and_cellular", "never"],
+            "labels": {
+                "wifi_only": "Wi-Fi only",
+                "wifi_and_cellular": "Wifi and cellular",
+                "never": "Never",
+            },
+            "description": "Automatic media download condition",
+        }
+        media_quality_control = {
+            "value": media_quality,
+            "options": ["data_saver", "standard", "hd_quality"],
+            "labels": {
+                "data_saver": "Data saver",
+                "standard": "Standard",
+                "hd_quality": "HD quality",
+                "hd": "HD quality",
+            },
+            "description": "Media upload quality (Data saver / Standard / HD quality)",
+        }
+        read_receipts_control = {
+            "value": read_receipts,
+            "status": "on" if read_receipts else "off",
+            "options": ["on", "off"],
+            "labels": {"on": "On", "off": "Off"},
+            "description": "Send or suppress read status",
+        }
+        typing_indicator_control = {
+            "value": typing_indicator_bool,
+            "status": "on" if typing_indicator_bool else "off",
+            "options": ["on", "off"],
+            "labels": {"on": "On", "off": "Off"},
+            "privacy_setting": typing_raw,
+            "description": "Show or hide typing status",
+        }
+        message_reactions_control = {
+            "value": message_reactions,
+            "status": "on" if message_reactions else "off",
+            "options": ["on", "off"],
+            "labels": {"on": "On", "off": "Off"},
+            "description": "Enable or disable emoji reactions",
+        }
+
+        sections = {
+            "appearance": {
+                "title": "Appearance",
+                "theme": theme_control,
+                "chat_wallpaper": wallpaper_control,
+                "font_size": font_size_control,
+            },
+            "media_and_links": {
+                "title": "Media & Links",
+                "show_link_previews": show_link_previews_control,
+                "auto_download_media": auto_download_control,
+                "media_quality": media_quality_control,
+            },
+            "message_behaviour": {
+                "title": "Message Behaviour",
+                "read_receipts": read_receipts_control,
+                "typing_indicator": typing_indicator_control,
+                "message_reactions": message_reactions_control,
+            },
+        }
+
+        chat_controls = {
+            "theme": theme_control,
+            "chat_wallpaper": wallpaper_control,
+            "font_size": font_size_control,
+            "show_link_previews": show_link_previews_control,
+            "auto_download_media": auto_download_control,
+            "media_quality": media_quality_control,
+            "read_receipts": read_receipts_control,
+            "typing_indicator": typing_indicator_control,
+            "message_reactions": message_reactions_control,
+        }
+
+        data.update({
+            "theme": theme,
+            "chat_wallpaper": wallpaper,
+            "font_size": font_size,
+            "show_link_previews": show_link_previews,
+            "auto_download_media": auto_download_media,
+            "media_quality": media_quality,
+            "read_receipts": read_receipts,
+            "typing_indicator": typing_indicator_bool,
+            "message_reactions": message_reactions,
+            "sections": sections,
+            "chat_controls": chat_controls,
+        })
+        return Response(data)
 
     def patch(self, request):
-        data = request.data
+        data = dict(request.data)
         if not isinstance(data, dict):
             return Response({"detail": "Invalid data format."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -1341,10 +1776,98 @@ class ChatPreferencesView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        updated = update_section_preferences(request.user.id, "chats", data)
+        user_id = request.user.id
+        app_updates = {}
+        priv_updates = {}
+        stor_updates = {}
+        from .privacy_flow import _to_bool
+        from .models import UserPrivacySettings
+
+        if "theme" in data:
+            val = str(data["theme"]).lower().strip()
+            if val in ("light", "dark", "system"):
+                app_updates["theme_mode"] = val
+                app_updates["theme"] = val
+                data["theme"] = val
+
+        if "chat_wallpaper" in data or "wallpaper" in data:
+            wall = data.get("chat_wallpaper") or data.get("wallpaper")
+            app_updates["wallpaper"] = wall
+            data["chat_wallpaper"] = wall
+
+        if "font_size" in data:
+            fval = str(data["font_size"]).lower().strip()
+            if fval in ("small", "medium", "large"):
+                app_updates["font_size"] = fval
+                data["font_size"] = fval
+
+        if "show_link_previews" in data:
+            slp_val = _to_bool(data["show_link_previews"])
+            data["show_link_previews"] = slp_val
+
+        if "auto_download_media" in data:
+            ad_val = str(data["auto_download_media"]).lower().strip().replace("-", "_").replace(" ", "_")
+            if ad_val in ("wifi_only", "wifi"):
+                ad_norm = "wifi_only"
+            elif ad_val in ("wifi_and_cellular", "wifi_cellular", "cellular", "mobile_data"):
+                ad_norm = "wifi_and_cellular"
+            elif ad_val in ("never", "none"):
+                ad_norm = "never"
+            else:
+                ad_norm = data["auto_download_media"]
+            data["auto_download_media"] = ad_norm
+
+        if "media_quality" in data:
+            mq_val = str(data["media_quality"]).lower().strip().replace(" ", "_")
+            if mq_val in ("data_saver", "datasaver", "low"):
+                mq_norm = "data_saver"
+            elif mq_val in ("hd_quality", "hd quality"):
+                mq_norm = "hd_quality"
+            elif mq_val == "hd":
+                mq_norm = "hd"
+            elif mq_val == "standard":
+                mq_norm = "standard"
+            else:
+                mq_norm = data["media_quality"]
+            data["media_quality"] = mq_norm
+            stor_updates["upload_quality"] = mq_norm
+            stor_updates["download_quality"] = mq_norm
+
+        if "read_receipts" in data:
+            rr_val = _to_bool(data["read_receipts"])
+            priv_updates["read_receipts"] = rr_val
+            data["read_receipts"] = rr_val
+            db_s = UserPrivacySettings.objects.filter(user=request.user).first()
+            if db_s:
+                db_s.read_receipts_enabled = rr_val
+                db_s.save(update_fields=["read_receipts_enabled"])
+
+        if "typing_indicator" in data:
+            ti_raw = data["typing_indicator"]
+            if isinstance(ti_raw, str) and ti_raw.lower() in ("on", "off"):
+                ti_bool = (ti_raw.lower() == "on")
+            elif isinstance(ti_raw, bool):
+                ti_bool = ti_raw
+            else:
+                ti_bool = (str(ti_raw).lower() != "nobody")
+            priv_updates["typing_indicator"] = "everyone" if ti_bool else "nobody"
+            data["typing_indicator"] = ti_bool
+
+        if "message_reactions" in data:
+            mr_val = _to_bool(data["message_reactions"])
+            data["message_reactions"] = mr_val
+
+        if app_updates:
+            update_section_preferences(user_id, "appearance", app_updates)
+        if priv_updates:
+            update_section_preferences(user_id, "privacy", priv_updates)
+        if stor_updates:
+            update_section_preferences(user_id, "storage", stor_updates)
+
+        updated = update_section_preferences(user_id, "chats", data)
         return Response({
             "detail": "Chat settings updated successfully.",
-            "settings": updated
+            "settings": updated,
         })
 
     put = patch
@@ -2484,8 +3007,8 @@ class CallSettingsView(APIView):
     """
     Call Settings flow:
     - Call Settings: Everyone / My Contacts / Nobody (Who can call me)
-    - Video Call Settings: Video Quality (Auto, 1080p, 720p, 480p, 360p), Low Data Mode, Mirror My Video
-    - Call Management: Call Waiting, Silence Unknown Callers
+    - Video Call Settings: Video Quality (Auto (Recommended), Full HD (1080p), HD (720p), Data Saver (480p)), Low Data Mode (on/off), Mirror My Video (on/off)
+    - Call Management: Call Waiting (on/off), Silence Unknown Callers (on/off)
     - Plus legacy call notification settings (ringtone, alerts, vibration).
 
     GET   /api/settings/calls/  — Full settings flow
@@ -2731,7 +3254,12 @@ class GroupMemberApprovalPreferenceView(APIView):
 
 class GroupAdminControlsPreferenceView(APIView):
     """
-    Admin Controls: default_preset (admins / all_members)
+    Admin Controls & Admin Permissions:
+    - Edit Group Info: on / off
+    - Send Messages: on / off
+    - Add Other Members: on / off
+    - Pin Messages: on / off
+    - Default preset: admins / all_members
 
     GET   /api/settings/groups/admin-controls/
     PATCH /api/settings/groups/admin-controls/
@@ -2748,10 +3276,12 @@ class GroupAdminControlsPreferenceView(APIView):
         val = request.data.get("default_preset") or request.data.get("admin_controls_preset")
         updated = update_group_settings_flow(request.user, {
             "admin_controls_preset": val,
+            "admin_controls": request.data,
+            "admin_permissions": request.data,
             **request.data,
         }, request)
         return Response({
-            "detail": "Admin controls preset updated.",
+            "detail": "Admin permissions updated successfully.",
             **updated["group_privacy"]["admin_controls"],
         })
 
@@ -2861,12 +3391,15 @@ class NearbyPlacesView(APIView):
 class NearbyBusinessesView(APIView):
     """
     GET /api/discovery/businesses/
-    Discover nearby Exi-registered businesses.
+    GET /api/business/search/
+    Search and discover Exi-registered businesses to recommend or contact (Steps A, B, C in flowchart).
     """
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        query = (request.query_params.get("q") or "").strip()
+        query = (request.query_params.get("q") or request.query_params.get("query") or "").strip()
+        category_filter = (request.query_params.get("category") or "").strip()
+
         businesses_qs = User.objects.filter(
             is_business=True, is_active=True
         ).exclude(business_name="")
@@ -2877,23 +3410,46 @@ class NearbyBusinessesView(APIView):
                 Q(business_name__icontains=query)
                 | Q(display_name__icontains=query)
                 | Q(bio__icontains=query)
+                | Q(business_address__icontains=query)
             )
 
         businesses = []
         for biz in businesses_qs[:50]:
+            biz_prefs = get_section_preferences(biz.id, "business") or {}
+            categories = biz_prefs.get("categories", ["General"])
+            if category_filter and not any(category_filter.lower() in c.lower() for c in categories):
+                continue
+
+            share_ident = biz.exi_id or str(biz.id)
+            share_url = request.build_absolute_uri(f"/biz/{share_ident}")
+            photo_url = request.build_absolute_uri(biz.profile_photo.url) if biz.profile_photo else None
+
             businesses.append({
                 "user_id": biz.id,
+                "business_id": biz.id,
                 "exi_id": biz.exi_id,
                 "business_name": biz.business_name,
                 "display_name": biz.display_name or biz.business_name,
+                "category": categories[0] if categories else "General",
+                "categories": categories,
                 "bio": biz.bio,
                 "business_address": biz.business_address,
                 "business_website": biz.business_website,
-                "profile_photo": request.build_absolute_uri(biz.profile_photo.url) if biz.profile_photo else None,
+                "profile_photo": photo_url,
+                "avatar_url": photo_url,
+                "rating": biz_prefs.get("rating", 4.9),
+                "review_count": biz_prefs.get("review_count", 0),
+                "recommendation_count": biz_prefs.get("recommendation_count", 0),
+                "is_verified": biz_prefs.get("verified", True),
+                "profile_url": f"/api/business/{share_ident}/public/",
+                "recommend_url": f"/api/business/{biz.id}/recommend/",
+                "enquire_url": f"/api/business/{share_ident}/enquire/",
+                "share_url": share_url,
             })
 
         return Response({
             "query": query,
+            "category": category_filter,
             "count": len(businesses),
             "businesses": businesses,
         })
@@ -3225,6 +3781,713 @@ class BusinessCustomerChatView(APIView):
         return Response({"detail": "Customer chat settings updated."})
 
     put = patch
+
+
+def _calculate_opening_status(working_hours):
+    """
+    Computes opening status based on working_hours map.
+    Example working_hours:
+    {
+        "monday": {"open": "09:00", "close": "21:00", "is_closed": False},
+        ...
+    }
+    """
+    if not working_hours or not isinstance(working_hours, dict):
+        return {
+            "is_open_now": True,
+            "status_text": "Open Now",
+            "today_hours": "Open regular hours",
+        }
+
+    from django.utils import timezone
+    now = timezone.now()
+    day_name = now.strftime("%A").lower()
+    today_rule = working_hours.get(day_name, {})
+    if not today_rule:
+        return {
+            "is_open_now": True,
+            "status_text": "Open Now",
+            "today_hours": "Hours not specified",
+        }
+
+    if today_rule.get("is_closed"):
+        return {
+            "is_open_now": False,
+            "status_text": "Closed Today",
+            "today_hours": "Closed",
+        }
+
+    open_time_str = str(today_rule.get("open", "09:00"))
+    close_time_str = str(today_rule.get("close", "21:00"))
+    current_time_str = now.strftime("%H:%M")
+
+    is_open = open_time_str <= current_time_str <= close_time_str
+    status_text = f"Open now · Closes at {close_time_str}" if is_open else f"Closed · Opens at {open_time_str}"
+
+    return {
+        "is_open_now": is_open,
+        "status_text": status_text,
+        "today_hours": f"{open_time_str} - {close_time_str}",
+    }
+
+
+class BusinessRecommendView(APIView):
+    """
+    POST /api/business/recommend/
+    POST /api/business/<int:business_id>/recommend/
+    End-to-end "Recommend a Business" workflow:
+    - User selects business
+    - Selects phone contacts or chat conversations
+    - Adds personal message
+    - Saves endorsement, attaches business card to chat messages and notifies recipients
+    Payload:
+    {
+        "business_id": 12,                       # or via URL parameter
+        "business_exi_id": "EXI-BIZ-01",          # optional alternative
+        "phone_numbers": ["+91 98765 43210"],    # phone contacts
+        "contact_ids": [4, 7, ...],               # target user contacts
+        "conversation_ids": ["uuid-1", ...],      # existing direct/group chats
+        "note": "Great coffee & workspace!",      # personal message
+        "personal_message": "..."                 # alias for note
+    }
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, business_id=None):
+        import json
+        import uuid
+        from django.utils import timezone
+        from django.db.models import F
+        from chats.models import Conversation, ConversationParticipant, Message
+        from chats.utils import broadcast_chat_message, notify_new_message
+
+        biz_id = business_id or request.data.get("business_id")
+        biz_exi_id = request.data.get("business_exi_id")
+
+        biz_user = None
+        if biz_id:
+            biz_user = User.objects.filter(id=biz_id, is_business=True).first()
+            if not biz_user:
+                biz_user = User.objects.filter(id=biz_id).first()
+        if not biz_user and biz_exi_id:
+            biz_user = User.objects.filter(exi_id=biz_exi_id).first()
+
+        if not biz_user:
+            return Response({"detail": "Business not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        conv_ids = request.data.get("conversation_ids") or []
+        contact_ids = list(request.data.get("contact_ids") or [])
+        raw_phones = list(request.data.get("phone_numbers") or [])
+        raw_contacts = request.data.get("contacts") or []
+
+        for item in raw_contacts:
+            if isinstance(item, dict):
+                if item.get("phone"):
+                    raw_phones.append(item.get("phone"))
+                elif item.get("id"):
+                    contact_ids.append(item.get("id"))
+            elif isinstance(item, str):
+                raw_phones.append(item)
+
+        if not conv_ids and not contact_ids and not raw_phones:
+            return Response(
+                {"detail": "Provide at least one phone_number, contact_id, or conversation_id."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        note = (request.data.get("personal_message") or request.data.get("note") or "").strip()
+
+        # Step 6: Increment business recommendation counter AND save the endorsement
+        biz_prefs = get_section_preferences(biz_user.id, "business") or {}
+        biz_prefs["recommendation_count"] = biz_prefs.get("recommendation_count", 0) + 1
+
+        if note:
+            endorsements = biz_prefs.get("endorsements", [])
+            endorsement_record = {
+                "id": f"end-{uuid.uuid4().hex[:8]}",
+                "user_id": request.user.id,
+                "user_name": getattr(request.user, "display_name", None) or request.user.username,
+                "note": note,
+                "created_at": timezone.now().isoformat(),
+            }
+            endorsements.insert(0, endorsement_record)
+            biz_prefs["endorsements"] = endorsements[:50]
+
+        update_section_preferences(biz_user.id, "business", biz_prefs)
+
+        avatar_url = ""
+        if biz_user and getattr(biz_user, "profile_photo", None):
+            try:
+                avatar_url = request.build_absolute_uri(biz_user.profile_photo.url)
+            except Exception:
+                pass
+
+        categories = biz_prefs.get("categories", ["General"])
+        biz_name = biz_user.business_name or biz_user.username
+        share_ident = biz_user.exi_id or str(biz_user.id)
+        share_url = request.build_absolute_uri(f"/biz/{share_ident}")
+        profile_url = f"/api/business/{share_ident}/public/"
+        enquiry_url = f"/api/business/{share_ident}/enquire/"
+
+        card_data = {
+            "attachment_type": "business",
+            "business_id": biz_user.id,
+            "business_exi_id": biz_user.exi_id,
+            "business_name": biz_name,
+            "display_name": biz_user.display_name or biz_name,
+            "category": categories[0] if categories else "General",
+            "categories": categories,
+            "address": biz_user.business_address,
+            "website": biz_user.business_website,
+            "bio": biz_user.bio,
+            "rating": biz_prefs.get("rating", 4.9),
+            "review_count": biz_prefs.get("review_count", 0),
+            "recommendation_count": biz_prefs.get("recommendation_count", 1),
+            "is_verified": biz_prefs.get("verified", True),
+            "avatar_url": avatar_url,
+            "note": note,
+            "personal_message": note,
+            "share_url": share_url,
+            "profile_url": profile_url,
+            "enquiry_url": enquiry_url,
+            "can_chat": True,
+            "can_enquire": True,
+            "recommended_by_id": request.user.id,
+            "recommended_by_name": getattr(request.user, "display_name", None) or request.user.username,
+            "recommended_at": timezone.now().isoformat(),
+            "can_view_catalog": len(biz_prefs.get("products", [])) > 0,
+            "products_preview": biz_prefs.get("products", [])[:3],
+        }
+
+        delivered_chats = []
+        external_shares = []
+
+        # 1. Deliver to existing conversations (direct or group chats)
+        for cid in conv_ids:
+            try:
+                ConversationParticipant.objects.get(
+                    conversation_id=cid, user=request.user, deleted_at__isnull=True
+                )
+                msg = Message.objects.create(
+                    conversation_id=cid,
+                    sender=request.user,
+                    content=json.dumps(card_data),
+                    message_type="business",
+                    status="sent",
+                )
+                Conversation.objects.filter(id=cid).update(updated_at=timezone.now())
+                ConversationParticipant.objects.filter(conversation_id=cid).exclude(
+                    user=request.user
+                ).update(unread_count=F("unread_count") + 1, deleted_at=None)
+                broadcast_chat_message(cid, msg)
+                notify_new_message(msg)
+                delivered_chats.append(str(cid))
+            except Exception:
+                pass
+
+        # 2. Deliver to contact_ids
+        for target_uid in contact_ids:
+            try:
+                other_user = User.objects.filter(id=target_uid).first()
+                if not other_user or other_user.id == request.user.id:
+                    continue
+
+                direct_conv = Conversation.objects.filter(
+                    type="direct",
+                    participants=request.user
+                ).filter(
+                    participants=other_user
+                ).first()
+
+                if not direct_conv:
+                    direct_conv = Conversation.objects.create(type="direct")
+                    ConversationParticipant.objects.create(conversation=direct_conv, user=request.user)
+                    ConversationParticipant.objects.create(conversation=direct_conv, user=other_user)
+
+                cid = direct_conv.id
+                msg = Message.objects.create(
+                    conversation_id=cid,
+                    sender=request.user,
+                    content=json.dumps(card_data),
+                    message_type="business",
+                    status="sent",
+                )
+                Conversation.objects.filter(id=cid).update(updated_at=timezone.now())
+                ConversationParticipant.objects.filter(conversation_id=cid).exclude(
+                    user=request.user
+                ).update(unread_count=F("unread_count") + 1, deleted_at=None)
+                broadcast_chat_message(cid, msg)
+                notify_new_message(msg)
+                delivered_chats.append(str(cid))
+            except Exception:
+                pass
+
+        # 3. Deliver to phone_numbers
+        for raw_p in raw_phones:
+            p = str(raw_p).strip()
+            if not p:
+                continue
+            digits_only = "".join(ch for ch in p if ch.isdigit())
+            other_user = User.objects.filter(phone=p).first()
+            if not other_user and len(digits_only) >= 10:
+                other_user = User.objects.filter(phone__icontains=digits_only[-10:]).first()
+
+            if other_user and other_user.id != request.user.id:
+                direct_conv = Conversation.objects.filter(
+                    type="direct",
+                    participants=request.user
+                ).filter(
+                    participants=other_user
+                ).first()
+
+                if not direct_conv:
+                    direct_conv = Conversation.objects.create(type="direct")
+                    ConversationParticipant.objects.create(conversation=direct_conv, user=request.user)
+                    ConversationParticipant.objects.create(conversation=direct_conv, user=other_user)
+
+                cid = direct_conv.id
+                msg = Message.objects.create(
+                    conversation_id=cid,
+                    sender=request.user,
+                    content=json.dumps(card_data),
+                    message_type="business",
+                    status="sent",
+                )
+                Conversation.objects.filter(id=cid).update(updated_at=timezone.now())
+                ConversationParticipant.objects.filter(conversation_id=cid).exclude(
+                    user=request.user
+                ).update(unread_count=F("unread_count") + 1, deleted_at=None)
+                broadcast_chat_message(cid, msg)
+                notify_new_message(msg)
+                delivered_chats.append(str(cid))
+            else:
+                msg_body = f"{note + ' ' if note else ''}Check out {biz_name} on EXI: {share_url}".strip()
+                external_shares.append({
+                    "phone": p,
+                    "share_url": share_url,
+                    "message": msg_body,
+                    "is_registered": False,
+                })
+
+        return Response({
+            "detail": f"Business recommended successfully to {len(delivered_chats)} conversation(s).",
+            "business_name": biz_name,
+            "share_url": share_url,
+            "delivered_count": len(delivered_chats),
+            "delivered_conversations": delivered_chats,
+            "external_shares": external_shares,
+            "recommendation_count": biz_prefs.get("recommendation_count", 1),
+            "card": card_data,
+        }, status=status.HTTP_200_OK)
+
+
+class PublicBusinessProfileView(APIView):
+    """
+    GET /api/business/<str:business_identifier>/public/
+    GET /api/business/<str:business_identifier>/profile/
+    GET /biz/<str:business_identifier>/
+    Public profile endpoint for a business.
+    Shows business information, catalog, opening status, recommendation count, social proof,
+    and action triggers: Say hi, Recommend, Share, Send in exi, Enquire, Chat.
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request, business_identifier):
+        biz_user = None
+        ident = str(business_identifier).strip()
+        if ident.isdigit():
+            biz_user = User.objects.filter(id=int(ident)).first()
+        if not biz_user:
+            biz_user = User.objects.filter(exi_id=ident).first()
+        if not biz_user:
+            biz_user = User.objects.filter(username=ident).first()
+
+        if not biz_user:
+            return Response({"detail": "Business not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        biz_prefs = get_section_preferences(biz_user.id, "business") or {}
+        categories = biz_prefs.get("categories", ["General"])
+        opening_status = _calculate_opening_status(biz_prefs.get("working_hours", {}))
+        endorsements = biz_prefs.get("endorsements", [])
+        rec_count = biz_prefs.get("recommendation_count", len(endorsements))
+        review_count = biz_prefs.get("review_count", 0)
+        rating = biz_prefs.get("rating", 4.9)
+
+        avatar_url = ""
+        if getattr(biz_user, "profile_photo", None):
+            try:
+                avatar_url = request.build_absolute_uri(biz_user.profile_photo.url)
+            except Exception:
+                pass
+
+        share_ident = biz_user.exi_id or str(biz_user.id)
+        share_url = request.build_absolute_uri(f"/biz/{share_ident}")
+
+        social_proof = {
+            "rating": rating,
+            "review_count": review_count,
+            "recommendation_count": rec_count,
+            "endorsements_count": len(endorsements),
+            "recent_endorsements": endorsements[:5],
+            "badges": [
+                b for b in [
+                    "Verified EXI Business" if biz_prefs.get("verified", True) else None,
+                    "Top Recommended" if rec_count > 0 else None,
+                    "Fast Responder",
+                ] if b
+            ],
+        }
+
+        return Response({
+            "business_id": biz_user.id,
+            "exi_id": biz_user.exi_id,
+            "business_name": biz_user.business_name or biz_user.username,
+            "display_name": biz_user.display_name or biz_user.business_name or biz_user.username,
+            "category": categories[0] if categories else "General",
+            "categories": categories,
+            "bio": biz_user.bio,
+            "business_address": biz_user.business_address,
+            "business_website": biz_user.business_website,
+            "phone": biz_user.phone,
+            "avatar_url": avatar_url,
+            "is_verified": biz_prefs.get("verified", True),
+            "opening_status": opening_status,
+            "rating": rating,
+            "review_count": review_count,
+            "recommendation_count": rec_count,
+            "social_proof": social_proof,
+            "working_hours": biz_prefs.get("working_hours", {}),
+            "social_links": biz_prefs.get("social_links", {}),
+            "catalog": biz_prefs.get("products", []),
+            "offers": biz_prefs.get("offers", []),
+            "share_url": share_url,
+            "actions": {
+                "can_say_hi": True,
+                "say_hi_endpoint": f"/api/business/{share_ident}/say-hi/",
+                "can_recommend": True,
+                "recommend_endpoint": f"/api/business/{biz_user.id}/recommend/",
+                "can_share": True,
+                "share_url": share_url,
+                "share_text": f"Check out {biz_user.business_name or biz_user.username} on EXI: {share_url}",
+                "can_send_in_exi": True,
+                "recipients_endpoint": "/api/business/recommend/recipients/",
+                "can_enquire": True,
+                "enquire_endpoint": f"/api/business/{share_ident}/enquire/",
+                "can_chat": True,
+                "chat_endpoint": "/api/chats/start/",
+                "chat_payload": {
+                    "user_id": biz_user.id,
+                    "exi_id": biz_user.exi_id,
+                },
+            }
+        }, status=status.HTTP_200_OK)
+
+
+class BusinessSayHiView(APIView):
+    """
+    POST /api/business/<str:business_identifier>/say-hi/
+    POST /api/business/say-hi/
+    Powers the 'Say hi' 1-click action from Step 4 of the journey.
+    Starts/opens 1-to-1 conversation with the business, sends a greeting message,
+    and returns active chat conversation details.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, business_identifier=None):
+        import json
+        from django.utils import timezone
+        from django.db.models import F
+        from chats.models import Conversation, ConversationParticipant, Message
+        from chats.utils import broadcast_chat_message, notify_new_message
+
+        ident = business_identifier or request.data.get("business_id") or request.data.get("business_exi_id")
+        if not ident:
+            return Response({"detail": "business_identifier is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        biz_user = None
+        ident_str = str(ident).strip()
+        if ident_str.isdigit():
+            biz_user = User.objects.filter(id=int(ident_str)).first()
+        if not biz_user:
+            biz_user = User.objects.filter(exi_id=ident_str).first()
+        if not biz_user:
+            biz_user = User.objects.filter(username=ident_str).first()
+
+        if not biz_user:
+            return Response({"detail": "Business not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if biz_user.id == request.user.id:
+            return Response({"detail": "Cannot say hi to your own business."}, status=status.HTTP_400_BAD_REQUEST)
+
+        direct_conv = Conversation.objects.filter(
+            type="direct",
+            participants=request.user
+        ).filter(
+            participants=biz_user
+        ).first()
+
+        if not direct_conv:
+            direct_conv = Conversation.objects.create(type="direct")
+            ConversationParticipant.objects.create(conversation=direct_conv, user=request.user)
+            ConversationParticipant.objects.create(conversation=direct_conv, user=biz_user)
+
+        greeting = (request.data.get("message") or "Hi! 👋 Excited to connect with your business.").strip()
+
+        msg = Message.objects.create(
+            conversation_id=direct_conv.id,
+            sender=request.user,
+            content=greeting,
+            message_type="text",
+            status="sent",
+        )
+
+        Conversation.objects.filter(id=direct_conv.id).update(updated_at=timezone.now())
+        ConversationParticipant.objects.filter(conversation_id=direct_conv.id).exclude(
+            user=request.user
+        ).update(unread_count=F("unread_count") + 1, deleted_at=None)
+
+        broadcast_chat_message(direct_conv.id, msg)
+        notify_new_message(msg)
+
+        return Response({
+            "detail": f"Said hi to {biz_user.business_name or biz_user.username} successfully!",
+            "conversation_id": str(direct_conv.id),
+            "business": {
+                "id": biz_user.id,
+                "name": biz_user.business_name or biz_user.username,
+                "exi_id": biz_user.exi_id,
+            },
+            "message": greeting,
+            "chat_endpoint": f"/api/chats/{direct_conv.id}/messages/",
+        }, status=status.HTTP_200_OK)
+
+
+class RecommendRecipientsView(APIView):
+    """
+    GET /api/business/recommend/recipients/
+    GET /api/chats/recipients/
+    Powers Step 5: Select recipients.
+    Fetches:
+    - Exi users (contacts & direct chat counterparts)
+    - Business contacts (commercial / business accounts)
+    - Groups (group chats user belongs to)
+    Allows multiple selections.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        from chats.models import ConversationParticipant, Conversation
+        query = (request.query_params.get("q") or "").strip().lower()
+
+        # 1. Groups
+        group_participants = ConversationParticipant.objects.filter(
+            user=request.user,
+            conversation__type="group",
+            deleted_at__isnull=True
+        ).select_related("conversation")
+
+        groups = []
+        for gp in group_participants:
+            conv = gp.conversation
+            from chats.group_views import _load_group_meta
+            meta = _load_group_meta(conv.id)
+            g_name = meta.get("name") or f"Group {str(conv.id)[:8]}"
+            if query and query not in g_name.lower():
+                continue
+            groups.append({
+                "recipient_key": f"group_{conv.id}",
+                "type": "group",
+                "conversation_id": str(conv.id),
+                "name": g_name,
+                "description": meta.get("description", ""),
+                "icon": meta.get("icon", ""),
+                "member_count": len(meta.get("members", [])),
+                "can_select": True,
+            })
+
+        # 2. Direct Conversations (users & businesses)
+        direct_participants = ConversationParticipant.objects.filter(
+            user=request.user,
+            conversation__type="direct",
+            deleted_at__isnull=True
+        ).select_related("conversation")
+
+        direct_conv_ids = [dp.conversation_id for dp in direct_participants]
+        other_participants = ConversationParticipant.objects.filter(
+            conversation_id__in=direct_conv_ids
+        ).exclude(user=request.user).select_related("user", "conversation")
+
+        users = []
+        businesses = []
+        seen_user_ids = set()
+
+        for op in other_participants:
+            other = op.user
+            if other.id in seen_user_ids or not other.is_active:
+                continue
+            seen_user_ids.add(other.id)
+
+            d_name = other.display_name or (other.business_name if other.is_business else None) or other.username
+            if query and (query not in d_name.lower() and query not in (other.phone or "").lower()):
+                continue
+
+            avatar = request.build_absolute_uri(other.profile_photo.url) if other.profile_photo else None
+            entry = {
+                "recipient_key": f"user_{other.id}",
+                "id": other.id,
+                "user_id": other.id,
+                "exi_id": other.exi_id,
+                "conversation_id": str(op.conversation_id),
+                "name": d_name,
+                "username": other.username,
+                "phone": other.phone,
+                "avatar_url": avatar,
+                "is_business": other.is_business,
+                "can_select": True,
+            }
+
+            if other.is_business:
+                entry["type"] = "business"
+                entry["business_name"] = other.business_name or other.username
+                businesses.append(entry)
+            else:
+                entry["type"] = "user"
+                users.append(entry)
+
+        # Also include user's address book contacts if not yet in chat
+        from accounts.user_preferences import get_section_preferences
+        contacts_pref = get_section_preferences(request.user.id, "contacts") or {}
+        contact_list = contacts_pref.get("contact_list", [])
+        for c in contact_list:
+            c_phone = c.get("phone_number") or c.get("phone") or ""
+            c_name = c.get("name") or f"{c.get('first_name', '')} {c.get('last_name', '')}".strip() or "Contact"
+            if query and query not in c_name.lower() and query not in c_phone:
+                continue
+            matched = User.objects.filter(phone=c_phone).first() if c_phone else None
+            if matched and matched.id in seen_user_ids:
+                continue
+            if matched:
+                seen_user_ids.add(matched.id)
+
+            c_entry = {
+                "recipient_key": f"contact_{c.get('id', c_phone)}",
+                "id": matched.id if matched else c.get("id"),
+                "user_id": matched.id if matched else None,
+                "exi_id": matched.exi_id if matched else None,
+                "conversation_id": None,
+                "name": c_name,
+                "phone": c_phone,
+                "avatar_url": request.build_absolute_uri(matched.profile_photo.url) if (matched and matched.profile_photo) else None,
+                "is_business": matched.is_business if matched else False,
+                "type": "business" if (matched and matched.is_business) else "user",
+                "can_select": True,
+            }
+            if matched and matched.is_business:
+                businesses.append(c_entry)
+            else:
+                users.append(c_entry)
+
+        return Response({
+            "allow_multiple_selections": True,
+            "counts": {
+                "users": len(users),
+                "businesses": len(businesses),
+                "groups": len(groups),
+                "total": len(users) + len(businesses) + len(groups),
+            },
+            "recipients": {
+                "users": users,
+                "businesses": businesses,
+                "groups": groups,
+            },
+            "all": users + businesses + groups,
+        }, status=status.HTTP_200_OK)
+
+
+class BusinessEnquiryView(APIView):
+    """
+    POST /api/business/<str:business_identifier>/enquire/
+    POST /api/business/enquire/
+    Directly initiate contact or send an enquiry to the business (Step K in flowchart).
+    Creates or retrieves the 1-to-1 conversation, sends the enquiry message,
+    and returns direct chat connection details.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, business_identifier=None):
+        import json
+        from django.utils import timezone
+        from django.db.models import F
+        from chats.models import Conversation, ConversationParticipant, Message
+        from chats.utils import broadcast_chat_message, notify_new_message
+
+        ident = business_identifier or request.data.get("business_id") or request.data.get("business_exi_id")
+        if not ident:
+            return Response({"detail": "business_identifier is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        biz_user = None
+        ident_str = str(ident).strip()
+        if ident_str.isdigit():
+            biz_user = User.objects.filter(id=int(ident_str)).first()
+        if not biz_user:
+            biz_user = User.objects.filter(exi_id=ident_str).first()
+        if not biz_user:
+            biz_user = User.objects.filter(username=ident_str).first()
+
+        if not biz_user:
+            return Response({"detail": "Business not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if biz_user.id == request.user.id:
+            return Response({"detail": "Cannot enquire with your own business."}, status=status.HTTP_400_BAD_REQUEST)
+
+        direct_conv = Conversation.objects.filter(
+            type="direct",
+            participants=request.user
+        ).filter(
+            participants=biz_user
+        ).first()
+
+        if not direct_conv:
+            direct_conv = Conversation.objects.create(type="direct")
+            ConversationParticipant.objects.create(conversation=direct_conv, user=request.user)
+            ConversationParticipant.objects.create(conversation=direct_conv, user=biz_user)
+
+        enquiry_text = (request.data.get("message") or request.data.get("note") or "").strip()
+        if not enquiry_text:
+            product_name = request.data.get("product_name") or ""
+            if product_name:
+                enquiry_text = f"Hi! I would like to enquire about '{product_name}' from your catalog."
+            else:
+                enquiry_text = f"Hi! I was recommended your business and would like to enquire about your services."
+
+        msg = Message.objects.create(
+            conversation_id=direct_conv.id,
+            sender=request.user,
+            content=enquiry_text,
+            message_type="text",
+            status="sent",
+        )
+
+        Conversation.objects.filter(id=direct_conv.id).update(updated_at=timezone.now())
+        ConversationParticipant.objects.filter(conversation_id=direct_conv.id).exclude(
+            user=request.user
+        ).update(unread_count=F("unread_count") + 1, deleted_at=None)
+
+        broadcast_chat_message(direct_conv.id, msg)
+        notify_new_message(msg)
+
+        return Response({
+            "detail": f"Enquiry sent successfully to {biz_user.business_name or biz_user.username}.",
+            "conversation_id": str(direct_conv.id),
+            "business": {
+                "id": biz_user.id,
+                "name": biz_user.business_name or biz_user.username,
+                "exi_id": biz_user.exi_id,
+            },
+            "message_id": str(msg.id),
+            "enquiry_text": enquiry_text,
+            "chat_endpoint": f"/api/chats/{direct_conv.id}/messages/",
+        }, status=status.HTTP_201_CREATED)
 
 
 # ============================================================
@@ -3837,29 +5100,129 @@ class UserQRCodeView(APIView):
         })
 
     def post(self, request):
-        qr_data = (request.data.get("qr_data") or request.data.get("code") or "").strip()
+        qr_data = (
+            request.data.get("qr_data")
+            or request.data.get("code")
+            or request.data.get("image_data")
+            or ""
+        ).strip()
         if not qr_data:
             return Response({"detail": "qr_data is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Parse exi://user/<exi_id> or raw EXI ID
-        exi_id = qr_data
-        if "exi://user/" in qr_data:
-            exi_id = qr_data.split("exi://user/")[-1]
-        elif "/invite/" in qr_data:
-            exi_id = qr_data.split("/invite/")[-1]
+        # Step 2: Resolve the code — parse scanner/gallery EXI URI variations
+        raw_code = qr_data
+        for prefix in ("exi://biz/", "exi://business/", "exi://user/", "/biz/", "/invite/", "/business/"):
+            if prefix in raw_code:
+                raw_code = raw_code.split(prefix)[-1]
+                break
 
-        target = _find_user_by_exi_id(exi_id)
+        if "/" in raw_code:
+            raw_code = raw_code.split("/")[-1]
+
+        target = _find_user_by_exi_id(raw_code)
+        if not target and raw_code.isdigit():
+            target = User.objects.filter(id=int(raw_code), is_active=True).first()
+
         if not target:
             return Response({"detail": "Invalid or expired EXI code."}, status=status.HTTP_404_NOT_FOUND)
 
-        serializer = PublicProfileSerializer(target, context={"request": request})
+        is_biz = bool(target.is_business)
         conv_id = _get_direct_conversation_id(request.user, target)
+        share_ident = target.exi_id or str(target.id)
+        share_url = request.build_absolute_uri(f"/biz/{share_ident}") if is_biz else request.build_absolute_uri(f"/invite/{share_ident}")
 
+        if is_biz:
+            # Step 2 & 3: Identified as Business; display profile with catalog, opening status, recommendation count, social proof
+            biz_prefs = get_section_preferences(target.id, "business") or {}
+            categories = biz_prefs.get("categories", ["General"])
+            opening_status = _calculate_opening_status(biz_prefs.get("working_hours", {}))
+            endorsements = biz_prefs.get("endorsements", [])
+            rating = biz_prefs.get("rating", 4.9)
+            rec_count = biz_prefs.get("recommendation_count", len(endorsements))
+            review_count = biz_prefs.get("review_count", 0)
+
+            avatar_url = request.build_absolute_uri(target.profile_photo.url) if target.profile_photo else None
+
+            biz_data = {
+                "business_id": target.id,
+                "exi_id": target.exi_id,
+                "business_name": target.business_name or target.username,
+                "display_name": target.display_name or target.business_name or target.username,
+                "category": categories[0] if categories else "General",
+                "categories": categories,
+                "bio": target.bio,
+                "business_address": target.business_address,
+                "business_website": target.business_website,
+                "phone": target.phone,
+                "avatar_url": avatar_url,
+                "is_verified": biz_prefs.get("verified", True),
+                "opening_status": opening_status,
+                "rating": rating,
+                "review_count": review_count,
+                "recommendation_count": rec_count,
+                "social_proof": {
+                    "rating": rating,
+                    "review_count": review_count,
+                    "recommendation_count": rec_count,
+                    "endorsements_count": len(endorsements),
+                    "recent_endorsements": endorsements[:3],
+                    "badges": [
+                        b for b in [
+                            "Verified EXI Business" if biz_prefs.get("verified", True) else None,
+                            "Top Recommended" if rec_count > 0 else None,
+                            "Fast Responder",
+                        ] if b
+                    ],
+                },
+                "catalog": biz_prefs.get("products", []),
+                "share_url": share_url,
+            }
+
+            # Step 4: Choose an action (Say hi, Recommend, Share, Send in exi)
+            actions = {
+                "can_say_hi": True,
+                "say_hi_endpoint": f"/api/business/{share_ident}/say-hi/",
+                "can_recommend": True,
+                "recommend_endpoint": f"/api/business/{target.id}/recommend/",
+                "can_share": True,
+                "share_url": share_url,
+                "share_text": f"Check out {target.business_name or target.username} on EXI: {share_url}",
+                "can_send_in_exi": True,
+                "recipients_endpoint": "/api/business/recommend/recipients/",
+                "can_enquire": True,
+                "enquire_endpoint": f"/api/business/{share_ident}/enquire/",
+                "can_chat": True,
+                "chat_endpoint": "/api/chats/start/",
+                "chat_payload": {
+                    "user_id": target.id,
+                    "exi_id": target.exi_id,
+                },
+            }
+
+            return Response({
+                "resolved": True,
+                "entity_type": "business",
+                "is_business": True,
+                "business": biz_data,
+                "conversation_id": str(conv_id) if conv_id else None,
+                "is_contact": are_contacts(request.user, target),
+                "actions": actions,
+            })
+
+        # Step 2: Identified as Regular User
+        serializer = PublicProfileSerializer(target, context={"request": request})
         return Response({
             "resolved": True,
+            "entity_type": "user",
+            "is_business": False,
             "user": serializer.data,
             "conversation_id": str(conv_id) if conv_id else None,
             "is_contact": are_contacts(request.user, target),
+            "actions": {
+                "can_chat": True,
+                "chat_endpoint": "/api/chats/start/",
+                "can_say_hi": True,
+            }
         })
 
 

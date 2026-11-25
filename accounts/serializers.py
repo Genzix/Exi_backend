@@ -876,15 +876,19 @@ class BlockedUserSerializer(serializers.ModelSerializer):
 
 
 class DeleteAccountSerializer(serializers.Serializer):
-    password = serializers.CharField(write_only=True)
-    confirmation = serializers.CharField()
+    password = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    confirmation = serializers.CharField(required=True)
 
     def validate(self, data):
-        if data['confirmation'].strip().upper() != 'DELETE':
+        if data.get('confirmation', '').strip().upper() != 'DELETE':
             raise serializers.ValidationError({'confirmation': 'Type DELETE to confirm.'})
         user = self.context['request'].user
-        if not user.check_password(data['password']):
-            raise serializers.ValidationError({'password': 'Password is incorrect.'})
+        if user.has_usable_password():
+            pwd = data.get('password')
+            if not pwd:
+                raise serializers.ValidationError({'password': 'Password is required to confirm account deletion.'})
+            if not user.check_password(pwd):
+                raise serializers.ValidationError({'password': 'Password is incorrect.'})
         return data
 
 
