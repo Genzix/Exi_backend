@@ -1790,8 +1790,31 @@ class ChatPreferencesView(APIView):
                 app_updates["theme"] = val
                 data["theme"] = val
 
-        if "chat_wallpaper" in data or "wallpaper" in data:
-            wall = data.get("chat_wallpaper") or data.get("wallpaper")
+        if "chat_wallpaper" in data or "wallpaper" in data or "preset" in data:
+            wall = data.get("chat_wallpaper") or data.get("wallpaper") or data.get("preset")
+            if isinstance(wall, str):
+                found = next((p for p in WALLPAPER_PRESETS if p["id"] == wall.lower()), None)
+                if not found:
+                    legacy_map = {
+                        "default_canvas": "default_classic",
+                        "default": "default_classic",
+                        "obsidian_dark": "graphite_dark",
+                        "midnight_navy": "graphite_dark",
+                        "exi_lime_glow": "electric_lime",
+                        "soft_lavender": "rose_blossom",
+                    }
+                    mapped_id = legacy_map.get(wall.lower())
+                    found = next((p for p in WALLPAPER_PRESETS if p["id"] == mapped_id), None)
+                if found:
+                    wall = {
+                        "preset": found["id"],
+                        "name": found["name"],
+                        "color": found["color"],
+                        "blur": 0,
+                        "opacity": 1.0,
+                    }
+                else:
+                    wall = {"preset": wall, "color": "#FFFFFF", "blur": 0, "opacity": 1.0}
             app_updates["wallpaper"] = wall
             data["chat_wallpaper"] = wall
 
@@ -1868,6 +1891,137 @@ class ChatPreferencesView(APIView):
         return Response({
             "detail": "Chat settings updated successfully.",
             "settings": updated,
+        })
+
+    put = patch
+
+
+class ChatWallpaperView(APIView):
+    """
+    GET   /api/settings/chats/wallpaper/
+    PATCH /api/settings/chats/wallpaper/
+    Directly manage Chat Wallpaper presets (Image 1):
+    - Default Classic, Graphite Dark, Electric Lime, Sky Mist, Rose Blossom, Sage Clean
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        app_prefs = get_section_preferences(request.user.id, "appearance") or {}
+        chat_prefs = get_section_preferences(request.user.id, "chats") or {}
+        active_wallpaper = app_prefs.get("wallpaper", chat_prefs.get("chat_wallpaper", {
+            "preset": "default_classic", "url": "", "color": "#FFFFFF", "blur": 0, "opacity": 1.0,
+        }))
+        active_preset = active_wallpaper.get("preset", "default_classic") if isinstance(active_wallpaper, dict) else str(active_wallpaper)
+
+        return Response({
+            "title": "Chat Wallpaper",
+            "sheet_title": "Chat Wallpaper",
+            "description": "Select a preset background palette for all your chat threads.",
+            "active_preset": active_preset,
+            "wallpaper": active_wallpaper,
+            "presets": WALLPAPER_PRESETS,
+        })
+
+    def patch(self, request):
+        preset_choice = request.data.get("preset") or request.data.get("preset_id") or request.data.get("chat_wallpaper") or request.data.get("wallpaper")
+        if isinstance(preset_choice, dict) and "preset" in preset_choice:
+            preset_choice = preset_choice["preset"]
+
+        found = next((p for p in WALLPAPER_PRESETS if p["id"] == str(preset_choice).lower()), None)
+        if not found:
+            legacy_map = {
+                "default_canvas": "default_classic",
+                "default": "default_classic",
+                "obsidian_dark": "graphite_dark",
+                "midnight_navy": "graphite_dark",
+                "exi_lime_glow": "electric_lime",
+                "soft_lavender": "rose_blossom",
+            }
+            mapped_id = legacy_map.get(str(preset_choice).lower())
+            found = next((p for p in WALLPAPER_PRESETS if p["id"] == mapped_id), None)
+
+        if found:
+            wallpaper_val = {
+                "preset": found["id"],
+                "name": found["name"],
+                "color": found["color"],
+                "blur": 0,
+                "opacity": 1.0,
+            }
+        else:
+            wallpaper_val = request.data.get("wallpaper") or {
+                "preset": "default_classic",
+                "name": "Default Classic",
+                "color": "#FFFFFF",
+                "blur": 0,
+                "opacity": 1.0,
+            }
+
+        user_id = request.user.id
+        app_prefs = get_section_preferences(user_id, "appearance") or {}
+        app_prefs["wallpaper"] = wallpaper_val
+        update_section_preferences(user_id, "appearance", app_prefs)
+
+        chat_prefs = get_section_preferences(user_id, "chats") or {}
+        chat_prefs["chat_wallpaper"] = wallpaper_val
+        update_section_preferences(user_id, "chats", chat_prefs)
+
+        return Response({
+            "detail": "Chat wallpaper updated successfully.",
+            "active_preset": wallpaper_val.get("preset"),
+            "wallpaper": wallpaper_val,
+            "presets": WALLPAPER_PRESETS,
+        })
+
+    put = patch
+
+
+class ChatThemeView(APIView):
+    """
+    GET   /api/settings/chats/theme/
+    PATCH /api/settings/chats/theme/
+    Directly manage Choose Theme bottom sheet (Image 2):
+    - System ("Follows your phone's appearance setting")
+    - Light ("Always the bright palette")
+    - Dark ("Always the graphite palette")
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        app_prefs = get_section_preferences(request.user.id, "appearance") or {}
+        chat_prefs = get_section_preferences(request.user.id, "chats") or {}
+        active_theme = app_prefs.get("theme_mode", chat_prefs.get("theme", "system"))
+
+        return Response({
+            "title": "Choose Theme",
+            "sheet_title": "Choose Theme",
+            "description": "Applies to every chat thread on this device.",
+            "active_theme": active_theme,
+            "theme": active_theme,
+            "options": ["system", "light", "dark"],
+            "theme_options": THEME_OPTIONS,
+        })
+
+    def patch(self, request):
+        theme_val = str(request.data.get("theme") or request.data.get("theme_mode", "system")).lower().strip()
+        if theme_val not in ("system", "light", "dark"):
+            return Response({"detail": "Theme must be 'system', 'light', or 'dark'."}, status=status.HTTP_400_BAD_REQUEST)
+
+        user_id = request.user.id
+        app_prefs = get_section_preferences(user_id, "appearance") or {}
+        app_prefs["theme_mode"] = theme_val
+        app_prefs["theme"] = theme_val
+        update_section_preferences(user_id, "appearance", app_prefs)
+
+        chat_prefs = get_section_preferences(user_id, "chats") or {}
+        chat_prefs["theme"] = theme_val
+        update_section_preferences(user_id, "chats", chat_prefs)
+
+        return Response({
+            "detail": "Theme updated successfully.",
+            "active_theme": theme_val,
+            "theme": theme_val,
+            "theme_options": THEME_OPTIONS,
         })
 
     put = patch
@@ -5648,10 +5802,31 @@ class EditProfileView(APIView):
 
         user.save()
 
+        # Handle occupation / headline and location / city dynamically in user profile preferences
+        profile_updates = {}
+        if "occupation" in data or "headline" in data or "job_title" in data:
+            occ = str(data.get("occupation") or data.get("headline") or data.get("job_title", "")).strip()[:100]
+            profile_updates["occupation"] = occ
+            profile_updates["headline"] = occ
+        if "location" in data or "city" in data:
+            loc = str(data.get("location") or data.get("city", "")).strip()[:100]
+            profile_updates["location"] = loc
+            profile_updates["city"] = loc
+
+        if profile_updates:
+            p_prefs = get_section_preferences(user.id, "profile") or {}
+            p_prefs.update(profile_updates)
+            update_section_preferences(user.id, "profile", p_prefs)
+            c_prefs = get_section_preferences(user.id, "exi_card") or {}
+            c_prefs.update(profile_updates)
+            update_section_preferences(user.id, "exi_card", c_prefs)
+
         from .serializers import ProfileSerializer
+        prof_data = dict(ProfileSerializer(user, context={"request": request}).data)
+        prof_data.update(get_section_preferences(user.id, "profile") or {})
         return Response({
             "detail": "Profile updated successfully.",
-            "profile": ProfileSerializer(user, context={"request": request}).data,
+            "profile": prof_data,
         }, status=status.HTTP_200_OK)
 
     put = patch

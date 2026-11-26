@@ -1,9 +1,12 @@
+import io
 import json
 import logging
 import os
+import zipfile
 from datetime import timedelta
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import permissions, status
 from rest_framework.response import Response
@@ -15,11 +18,121 @@ from accounts.user_preferences import (
     update_section_preferences,
     export_user_chat_history,
 )
-from .models import Conversation, ConversationParticipant, StarredMessage
+from .models import Conversation, ConversationParticipant, StarredMessage, Message, Media
 from .serializers import StarredMessageSerializer
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# 5 Conversation-Level Theme & Wallpaper Palettes (Image 9)
+# ---------------------------------------------------------------------------
+CONVERSATION_WALLPAPER_PRESETS = [
+    {
+        "id": "default_canvas",
+        "name": "Default Canvas",
+        "color": "#FFFFFF",
+        "preview_color": "#FFFFFF",
+        "border_color": "#E2E8F0",
+        "text_color": "#0F172A",
+        "theme": "light",
+    },
+    {
+        "id": "obsidian_dark",
+        "name": "Obsidian Dark",
+        "color": "#0F172A",
+        "preview_color": "#0F172A",
+        "border_color": "#1E293B",
+        "text_color": "#F8FAFC",
+        "theme": "dark",
+    },
+    {
+        "id": "midnight_navy",
+        "name": "Midnight Navy",
+        "color": "#0B192C",
+        "preview_color": "#0B192C",
+        "border_color": "#1E293B",
+        "text_color": "#F8FAFC",
+        "theme": "dark",
+    },
+    {
+        "id": "exi_lime_glow",
+        "name": "Exi Lime Glow",
+        "color": "#ECFCCB",
+        "preview_color": "#ECFCCB",
+        "border_color": "#BEF264",
+        "text_color": "#1A2E05",
+        "theme": "light",
+    },
+    {
+        "id": "soft_lavender",
+        "name": "Soft Lavender",
+        "color": "#F3E8FF",
+        "preview_color": "#F3E8FF",
+        "border_color": "#E9D5FF",
+        "text_color": "#2E1065",
+        "theme": "light",
+    },
+]
+
+# Additional Presets matching Image 1
+CHAT_WALLPAPER_PRESETS_EXTENDED = [
+    {
+        "id": "default_classic",
+        "name": "Default Classic",
+        "color": "#FFFFFF",
+        "preview_color": "#FFFFFF",
+        "border_color": "#E2E8F0",
+        "text_color": "#0F172A",
+        "theme": "light",
+    },
+    {
+        "id": "graphite_dark",
+        "name": "Graphite Dark",
+        "color": "#1E293B",
+        "preview_color": "#1E293B",
+        "border_color": "#0F172A",
+        "text_color": "#F8FAFC",
+        "theme": "dark",
+    },
+    {
+        "id": "electric_lime",
+        "name": "Electric Lime",
+        "color": "#ECFCCB",
+        "preview_color": "#ECFCCB",
+        "border_color": "#BEF264",
+        "text_color": "#1A2E05",
+        "theme": "light",
+    },
+    {
+        "id": "sky_mist",
+        "name": "Sky Mist",
+        "color": "#E0F2FE",
+        "preview_color": "#E0F2FE",
+        "border_color": "#BAE6FD",
+        "text_color": "#082F49",
+        "theme": "light",
+    },
+    {
+        "id": "rose_blossom",
+        "name": "Rose Blossom",
+        "color": "#FCE7F3",
+        "preview_color": "#FCE7F3",
+        "border_color": "#FBCFE8",
+        "text_color": "#831843",
+        "theme": "light",
+    },
+    {
+        "id": "sage_clean",
+        "name": "Sage Clean",
+        "color": "#DCFCE7",
+        "preview_color": "#DCFCE7",
+        "border_color": "#BBF7D0",
+        "text_color": "#14532D",
+        "theme": "light",
+    },
+]
 
 
 # ---------------------------------------------------------------------------
@@ -33,30 +146,44 @@ def get_chat_theme_and_wallpaper(user_id, conversation_id):
     appearance = get_section_preferences(user_id, "appearance") or {}
 
     default_theme = appearance.get("chat_theme", "classic")
-    default_accent = appearance.get("accent_color", "#0084FF")
+    default_accent = appearance.get("accent_color", "#84CC16")
     default_wallpaper = appearance.get("wallpaper", {
-        "preset": "default",
+        "preset": "default_canvas",
+        "name": "Default Canvas",
         "url": "",
-        "color": "#0F172A",
+        "color": "#FFFFFF",
         "blur": 0,
         "opacity": 1.0,
     })
 
     if not custom:
+        active_preset = default_wallpaper.get("preset", "default_canvas") if isinstance(default_wallpaper, dict) else "default_canvas"
         return {
             "chat_theme": default_theme,
             "theme": default_theme,
             "accent_color": default_accent,
             "wallpaper": default_wallpaper,
             "is_custom": False,
+            "active_preset": active_preset,
+            "sheet_title": "Chat Theme & Wallpaper",
+            "subtitle": "Personalize this chat screen background",
+            "preview_dot_color": "#84CC16",
+            "presets": CONVERSATION_WALLPAPER_PRESETS,
         }
 
+    wallpaper_val = custom.get("wallpaper", default_wallpaper)
+    active_preset = custom.get("preset") or (wallpaper_val.get("preset") if isinstance(wallpaper_val, dict) else "default_canvas") or "default_canvas"
     return {
         "chat_theme": custom.get("chat_theme", custom.get("theme", default_theme)),
         "theme": custom.get("theme", custom.get("chat_theme", default_theme)),
         "accent_color": custom.get("accent_color", default_accent),
-        "wallpaper": custom.get("wallpaper", default_wallpaper),
+        "wallpaper": wallpaper_val,
         "is_custom": True,
+        "active_preset": active_preset,
+        "sheet_title": "Chat Theme & Wallpaper",
+        "subtitle": "Personalize this chat screen background",
+        "preview_dot_color": custom.get("accent_color", "#84CC16"),
+        "presets": CONVERSATION_WALLPAPER_PRESETS,
     }
 
 
@@ -65,6 +192,22 @@ def update_chat_theme_and_wallpaper(user_id, conversation_id, data):
     chat_themes = get_section_preferences(user_id, "chat_themes") or {}
     cid = str(conversation_id)
     current = chat_themes.get(cid, {})
+
+    preset_choice = data.get("preset") or data.get("preset_id") or data.get("wallpaper_preset")
+    all_avail_presets = CONVERSATION_WALLPAPER_PRESETS + CHAT_WALLPAPER_PRESETS_EXTENDED
+    if preset_choice:
+        found_preset = next((p for p in all_avail_presets if p["id"] == str(preset_choice).lower()), None)
+        if found_preset:
+            current["preset"] = found_preset["id"]
+            current["wallpaper"] = {
+                "preset": found_preset["id"],
+                "name": found_preset["name"],
+                "color": found_preset["color"],
+                "blur": 0,
+                "opacity": 1.0,
+            }
+            current["theme"] = found_preset["theme"]
+            current["chat_theme"] = found_preset["theme"]
 
     if "theme" in data:
         current["theme"] = data["theme"]
@@ -75,7 +218,12 @@ def update_chat_theme_and_wallpaper(user_id, conversation_id, data):
     if "accent_color" in data:
         current["accent_color"] = data["accent_color"]
     if "wallpaper" in data:
-        current["wallpaper"] = data["wallpaper"]
+        wp = data["wallpaper"]
+        if isinstance(wp, dict) and "preset" in wp:
+            found_preset = next((p for p in all_avail_presets if p["id"] == str(wp["preset"]).lower()), None)
+            if found_preset:
+                current["preset"] = found_preset["id"]
+        current["wallpaper"] = wp
 
     chat_themes[cid] = current
     update_section_preferences(user_id, "chat_themes", chat_themes)
@@ -189,6 +337,79 @@ def update_chat_lists_membership(user_id, conversation_id, data):
     return get_chat_lists_membership(user_id, conversation_id)
 
 
+def generate_chat_transcript_text(user, conversation, messages):
+    """Generates a clean text transcript formatted for .txt export."""
+    other_user = "Chat"
+    if conversation.type == "direct":
+        other = conversation.participants.exclude(id=user.id).first()
+        if other:
+            other_user = other.display_name or other.full_name or other.username
+
+    lines = [
+        "=" * 60,
+        "EXI Chat Transcript",
+        f"Conversation ID: {conversation.id}",
+        f"Chat With: {other_user}",
+        f"Exported Date: {timezone.now().strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        f"Total Messages: {len(messages)}",
+        "=" * 60,
+        "",
+    ]
+    for m in messages:
+        sender_name = "You" if m.sender_id == user.id else (getattr(m.sender, "display_name", None) or getattr(m.sender, "first_name", None) or getattr(m.sender, "username", "Unknown"))
+        time_str = m.created_at.strftime("%Y-%m-%d %H:%M:%S")
+        if m.message_type == "text" and m.content:
+            body = m.content
+        else:
+            body = m.content if m.content else f"[{m.message_type.upper()}]"
+        lines.append(f"[{time_str}] {sender_name}: {body}")
+
+    return "\n".join(lines)
+
+
+def generate_chat_zip_archive(user, conversation, messages, transcript_text):
+    """Creates an in-memory zip archive containing transcript and attached media/files."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        # 1. Transcript text
+        zip_file.writestr("transcript.txt", transcript_text.encode("utf-8"))
+
+        # 2. Metadata JSON
+        meta = {
+            "conversation_id": str(conversation.id),
+            "type": conversation.type,
+            "exported_at": timezone.now().isoformat(),
+            "exported_by": user.username,
+            "message_count": len(messages),
+        }
+        zip_file.writestr("metadata.json", json.dumps(meta, indent=2).encode("utf-8"))
+
+        # 3. Media files
+        media_count = 0
+        for m in messages:
+            # Check attached Media object
+            if getattr(m, "media", None):
+                med = m.media
+                media_count += 1
+                fname = getattr(med, "file_name", None) or (os.path.basename(med.file.name) if getattr(med, "file", None) else f"media_{med.id}.bin")
+                zip_path = f"media/{media_count:03d}_{fname}"
+                try:
+                    if getattr(med, "file", None) and hasattr(med.file, "path") and os.path.exists(med.file.path):
+                        with open(med.file.path, "rb") as f:
+                            zip_file.writestr(zip_path, f.read())
+                    else:
+                        zip_file.writestr(zip_path, f"Media file: {fname}".encode("utf-8"))
+                except Exception:
+                    zip_file.writestr(zip_path, f"Media reference: {fname}".encode("utf-8"))
+
+        # If no media files, add an empty placeholder note
+        if media_count == 0:
+            zip_file.writestr("media/readme.txt", "No media files attached in this conversation.".encode("utf-8"))
+
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 def get_chat_settings_flow_data(request_user, conversation_id):
     """
     Constructs the complete structured Navigation & Settings Flow object
@@ -207,10 +428,56 @@ def get_chat_settings_flow_data(request_user, conversation_id):
     cid = str(conversation_id)
     conv = participant.conversation
 
+    # Header info (Image 7)
+    conv_title = "Chat"
+    conv_subtitle = "Online"
+    conv_avatar = ""
+    other_user_info = None
+    is_blocked = False
+    is_restricted = False
+
+    if conv.type == "direct":
+        other = conv.participants.exclude(id=request_user.id).first()
+        if other:
+            conv_title = other.display_name or other.full_name or other.username
+            conv_subtitle = f"@{other.username}"
+            avatar_obj = getattr(other, "avatar", None)
+            if hasattr(avatar_obj, "url"):
+                conv_avatar = avatar_obj.url
+            elif isinstance(avatar_obj, str):
+                conv_avatar = avatar_obj
+            is_blocked = BlockedUser.objects.filter(blocker=request_user, blocked=other).exists()
+            is_restricted = is_user_restricted(request_user.id, other.id)
+            other_user_info = {
+                "id": other.id,
+                "username": other.username,
+                "display_name": other.display_name or other.username,
+                "full_name": other.full_name or "",
+            }
+    else:
+        from .group_views import _get_group_meta
+        meta = _get_group_meta(conversation_id) or {}
+        conv_title = meta.get("name") or "Group Chat"
+        member_count = conv.participants.filter(conversationparticipant__deleted_at__isnull=True).count()
+        conv_subtitle = f"{member_count} members"
+
+    header_data = {
+        "title": conv_title,
+        "subtitle": conv_subtitle,
+        "avatar": conv_avatar,
+        "type": conv.type,
+        "actions": [
+            {"id": "voice_call", "label": "Voice Call", "icon": "phone", "endpoint": "/api/calls/initiate/"},
+            {"id": "video_call", "label": "Video Call", "icon": "video", "endpoint": "/api/calls/initiate/"},
+            {"id": "search", "label": "Search", "icon": "search", "endpoint": f"/api/chats/{cid}/messages/"},
+            {"id": "contact_info", "label": "Contact Info", "icon": "info", "endpoint": f"/api/chats/{cid}/profile-card/"},
+        ],
+    }
+
     # 1. Favorite Chat status
     favorites_prefs = get_section_preferences(request_user.id, "favorites") or {}
     favorite_ids = set(favorites_prefs.get("chat_ids", []))
-    is_favorited = cid in favorite_ids
+    is_favorited = (cid in favorite_ids) or bool(participant.is_pinned)
 
     # 2. Disappearing Messages status
     disappearing_seconds = conv.disappearing_duration
@@ -236,21 +503,11 @@ def get_chat_settings_flow_data(request_user, conversation_id):
         user=request_user, message__conversation_id=conversation_id
     ).count()
 
-    # 6. Other user (for Direct chat block & restrict)
-    other_user_info = None
-    is_blocked = False
-    is_restricted = False
-    if conv.type == "direct":
-        other = conv.participants.exclude(id=request_user.id).first()
-        if other:
-            is_blocked = BlockedUser.objects.filter(blocker=request_user, blocked=other).exists()
-            is_restricted = is_user_restricted(request_user.id, other.id)
-            other_user_info = {
-                "id": other.id,
-                "username": other.username,
-                "display_name": other.display_name or other.username,
-                "full_name": other.full_name or "",
-            }
+    # 6. Message Count for Export Conversation sheet (Image 8)
+    msg_qs = Message.objects.filter(conversation_id=conversation_id)
+    if participant.cleared_at:
+        msg_qs = msg_qs.filter(created_at__gt=participant.cleared_at)
+    msg_count = msg_qs.count()
 
     # 7. Permissions
     from .chat_permissions import get_chat_permissions_display
@@ -259,56 +516,111 @@ def get_chat_settings_flow_data(request_user, conversation_id):
     return {
         "chat_id": cid,
         "type": conv.type,
+        "header": header_data,
         "sections": {
             "conversation": {
                 "title": "Conversation",
                 "favourite_chat": {
+                    "title": "Favourite Chat",
+                    "subtitle": "Quick access on home screen",
+                    "type": "toggle",
                     "is_favorited": is_favorited,
+                    "value": is_favorited,
+                    "status": "on" if is_favorited else "off",
                     "action_url": f"/api/chats/{cid}/favorite/",
                 },
                 "disappearing_messages": {
+                    "title": "Disappearing Messages",
+                    "subtitle": "Auto-vanish messages after timer",
                     "is_enabled": bool(disappearing_seconds),
                     "duration": disappearing_seconds,
                     "duration_label": duration_label,
                     "action_url": f"/api/chats/{cid}/disappearing/",
                 },
                 "chat_theme_wallpaper": {
+                    "title": "Chat Theme & Wallpaper",
+                    "subtitle": "Customize appearance and colors",
+                    "sheet_title": "Chat Theme & Wallpaper",
+                    "sheet_subtitle": "Personalize this chat screen background",
                     "theme": theme_wallpaper["theme"],
                     "chat_theme": theme_wallpaper["chat_theme"],
                     "accent_color": theme_wallpaper["accent_color"],
                     "wallpaper": theme_wallpaper["wallpaper"],
                     "is_custom": theme_wallpaper["is_custom"],
+                    "active_preset": theme_wallpaper.get("active_preset", "default_canvas"),
+                    "preview_dot_color": theme_wallpaper.get("preview_dot_color", "#84CC16"),
+                    "presets": theme_wallpaper.get("presets", CONVERSATION_WALLPAPER_PRESETS),
                     "action_url": f"/api/chats/{cid}/theme/",
                 },
                 "add_to_list": {
+                    "title": "Add to List",
+                    "subtitle": "Organize into Work, Friends, Family",
                     "in_list_ids": list_membership["in_list_ids"],
                     "lists": list_membership["lists"],
                     "total_lists": list_membership["total_lists"],
                     "action_url": f"/api/chats/{cid}/lists/",
                 },
                 "starred_messages": {
+                    "title": "Starred Messages",
+                    "subtitle": "Messages you starred in this chat",
                     "count": starred_count,
+                    "badge": str(starred_count),
                     "action_url": f"/api/chats/{cid}/starred/",
                 },
             },
             "preferences_tools": {
                 "title": "Preferences & Tools",
                 "mute_notifications": {
+                    "title": "Mute Notifications",
+                    "subtitle": "Alerts on for new messages",
                     "is_muted": participant.is_muted,
+                    "status": "On" if participant.is_muted else "Off",
                     "action_url": f"/api/chats/{cid}/mute/",
+                    "unmute_url": f"/api/chats/{cid}/unmute/",
                 },
                 "export_chat": {
+                    "title": "Export Chat",
+                    "subtitle": "Save transcript & shared media",
+                    "sheet_title": "Export Conversation",
+                    "message_count": msg_count,
+                    "message_count_label": f"{msg_count} message{'s' if msg_count != 1 else ''} in this thread",
+                    "options": [
+                        {
+                            "id": "without_media",
+                            "title": "Export Without Media",
+                            "subtitle": "Fast text transcript (.txt)",
+                            "format": "txt",
+                            "include_media": False,
+                            "action_url": f"/api/chats/{cid}/export/?include_media=false",
+                            "download_url": f"/api/chats/{cid}/export/?include_media=false&download=true",
+                        },
+                        {
+                            "id": "with_media",
+                            "title": "Export With Media & Files",
+                            "subtitle": "Full archive with photos & audio (.zip)",
+                            "format": "zip",
+                            "include_media": True,
+                            "action_url": f"/api/chats/{cid}/export/?include_media=true",
+                            "download_url": f"/api/chats/{cid}/export/?include_media=true&download=true",
+                        },
+                    ],
                     "action_url": f"/api/chats/{cid}/export/",
                 },
                 "chat_settings": {
+                    "title": "Chat Settings",
+                    "subtitle": "Media quality, font size & behaviour",
                     "permissions": chat_perms,
                     "action_url": f"/api/chats/{cid}/settings/",
+                    "global_settings_url": "/api/settings/chats/",
                 },
             },
             "management_danger_zone": {
                 "title": "Management & Danger Zone",
                 "archive_chat": {
+                    "title": "Archive Chat",
+                    "subtitle": "Unarchive this conversation" if participant.is_archived else "Archive this conversation",
                     "is_archived": participant.is_archived,
+                    "status": "archived" if participant.is_archived else "active",
                     "action_url": f"/api/chats/{cid}/archive/",
                 },
                 "block_or_restrict": {
@@ -319,10 +631,14 @@ def get_chat_settings_flow_data(request_user, conversation_id):
                     "restrict_url": f"/api/chats/{cid}/restrict/",
                 },
                 "clear_chat_history": {
+                    "title": "Clear Messages",
+                    "subtitle": "Clear chat history",
                     "cleared_at": participant.cleared_at.isoformat() if participant.cleared_at else None,
                     "action_url": f"/api/chats/{cid}/clear/",
                 },
                 "delete_conversation": {
+                    "title": "Delete Conversation",
+                    "subtitle": "Delete this conversation permanently",
                     "action_url": f"/api/chats/{cid}/delete/",
                 },
             },
@@ -449,21 +765,96 @@ class ChatStarredMessagesView(APIView):
 
 class ChatExportView(APIView):
     """
-    GET  /api/chats/<chat_id>/export/ - Export message history for this chat
-    POST /api/chats/<chat_id>/export/ - Export message history for this chat
+    GET  /api/chats/<chat_id>/export/ - Export Conversation sheet preview & downloads
+    POST /api/chats/<chat_id>/export/ - Export Conversation sheet preview & downloads
+    Supports:
+      - Export Without Media: Fast text transcript (.txt)
+      - Export With Media & Files: Full archive with photos & audio (.zip)
     """
     permission_classes = [permissions.IsAuthenticated]
 
+    def perform_content_negotiation(self, request, force=False):
+        fmt = request.GET.get("format")
+        if fmt in ("txt", "zip"):
+            from rest_framework.renderers import BaseRenderer
+            class PassthroughRenderer(BaseRenderer):
+                media_type = "*/*"
+                format = fmt
+                def render(self, data, accepted_media_type=None, renderer_context=None):
+                    return data
+            return (PassthroughRenderer(), "*/*")
+        return super().perform_content_negotiation(request, force=force)
+
     def get(self, request, chat_id):
         try:
-            ConversationParticipant.objects.get(
+            participant = ConversationParticipant.objects.select_related("conversation").get(
                 user=request.user, conversation_id=chat_id, deleted_at__isnull=True
             )
         except ConversationParticipant.DoesNotExist:
             return Response({"detail": "Conversation not found."}, status=status.HTTP_404_NOT_FOUND)
 
+        conv = participant.conversation
+        msg_qs = Message.objects.filter(conversation=conv).order_by("created_at")
+        if participant.cleared_at:
+            msg_qs = msg_qs.filter(created_at__gt=participant.cleared_at)
+        messages = list(msg_qs)
+
+        transcript_text = generate_chat_transcript_text(request.user, conv, messages)
+
+        req_data = request.data if hasattr(request, "data") and isinstance(request.data, dict) else {}
+        fmt = (request.GET.get("format") or req_data.get("format") or "").lower().strip()
+        include_media_raw = request.GET.get("include_media") if "include_media" in request.GET else req_data.get("include_media")
+        download_raw = request.GET.get("download") if "download" in request.GET else req_data.get("download")
+
+        is_download = str(download_raw).lower() in ("true", "1", "yes")
+        include_media = str(include_media_raw).lower() in ("true", "1", "yes")
+
+        # 1. Plain text transcript download (.txt)
+        if fmt == "txt" or (is_download and not include_media) or request.headers.get("Accept") == "text/plain":
+            resp = HttpResponse(transcript_text, content_type="text/plain; charset=utf-8")
+            resp["Content-Disposition"] = f'attachment; filename="chat_{chat_id}_transcript.txt"'
+            return resp
+
+        # 2. Full archive with media & files download (.zip)
+        if fmt == "zip" or (is_download and include_media) or (include_media and request.headers.get("Accept") == "application/zip"):
+            zip_bytes = generate_chat_zip_archive(request.user, conv, messages, transcript_text)
+            resp = HttpResponse(zip_bytes, content_type="application/zip")
+            resp["Content-Disposition"] = f'attachment; filename="chat_{chat_id}_archive.zip"'
+            return resp
+
+        # 3. JSON metadata response (Bottom sheet options matching Image 8)
         data = export_user_chat_history(request.user, chat_id=chat_id)
-        return Response(data)
+        total_count = len(messages)
+        return Response({
+            "sheet_title": "Export Conversation",
+            "chat_id": str(chat_id),
+            "message_count": total_count,
+            "subtitle": f"{total_count} message{'s' if total_count != 1 else ''} in this thread",
+            "options": [
+                {
+                    "id": "without_media",
+                    "title": "Export Without Media",
+                    "subtitle": "Fast text transcript (.txt)",
+                    "format": "txt",
+                    "include_media": False,
+                    "action_url": f"/api/chats/{chat_id}/export/?include_media=false",
+                    "download_url": f"/api/chats/{chat_id}/export/?include_media=false&download=true",
+                },
+                {
+                    "id": "with_media",
+                    "title": "Export With Media & Files",
+                    "subtitle": "Full archive with photos & audio (.zip)",
+                    "format": "zip",
+                    "include_media": True,
+                    "action_url": f"/api/chats/{chat_id}/export/?include_media=true",
+                    "download_url": f"/api/chats/{chat_id}/export/?include_media=true&download=true",
+                },
+            ],
+            "transcript_text": transcript_text,
+            "chats": data.get("chats", []),
+            "exported_at": data.get("exported_at"),
+            "user": data.get("user"),
+        })
 
     def post(self, request, chat_id):
         return self.get(request, chat_id)

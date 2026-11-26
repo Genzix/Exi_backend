@@ -49,6 +49,8 @@ from .views import (
     NotificationSettingsView,
     NotificationMuteView,
     ChatPreferencesView,
+    ChatWallpaperView,
+    ChatThemeView,
     ChatBackupView,
     ChatRestoreView,
     ChatHistoryExportView,
@@ -298,6 +300,8 @@ urlpatterns = [
 
     # Chats Settings
     path("settings/chats/", ChatPreferencesView.as_view()),
+    path("settings/chats/wallpaper/", ChatWallpaperView.as_view()),
+    path("settings/chats/theme/", ChatThemeView.as_view()),
     path("settings/chats/backup/", ChatBackupView.as_view()),
     path("settings/chats/restore/", ChatRestoreView.as_view()),
     path("settings/chats/history/export/", ChatHistoryExportView.as_view()),

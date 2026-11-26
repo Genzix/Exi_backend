@@ -226,11 +226,14 @@ class ArchiveChatView(APIView):
     def get(self, request, chat_id):
         try:
             participant = ConversationParticipant.objects.get(
-                user=request.user, conversation_id=chat_id
+                user=request.user, conversation_id=chat_id, deleted_at__isnull=True
             )
             return Response({
                 "chat_id": str(chat_id),
+                "title": "Archive Chat",
+                "subtitle": "Unarchive this conversation" if participant.is_archived else "Archive this conversation",
                 "is_archived": participant.is_archived,
+                "status": "archived" if participant.is_archived else "active",
             })
         except ConversationParticipant.DoesNotExist:
             return Response(
@@ -240,15 +243,28 @@ class ArchiveChatView(APIView):
     def patch(self, request, chat_id):
         try:
             participant = ConversationParticipant.objects.get(
-                user=request.user, conversation_id=chat_id
+                user=request.user, conversation_id=chat_id, deleted_at__isnull=True
             )
-            participant.is_archived = not participant.is_archived
+            req_data = request.data if hasattr(request, "data") and isinstance(request.data, dict) else {}
+            if "is_archived" in req_data:
+                participant.is_archived = str(req_data["is_archived"]).lower() in ("true", "1", "yes")
+            elif req_data.get("action") == "archive":
+                participant.is_archived = True
+            elif req_data.get("action") == "unarchive":
+                participant.is_archived = False
+            else:
+                participant.is_archived = not participant.is_archived
+
             participant.save(update_fields=["is_archived"])
             action = "archived" if participant.is_archived else "unarchived"
             return Response(
                 {
+                    "chat_id": str(chat_id),
+                    "title": "Archive Chat",
+                    "subtitle": "Unarchive this conversation" if participant.is_archived else "Archive this conversation",
                     "detail": f"Chat {action} successfully.",
                     "is_archived": participant.is_archived,
+                    "status": action,
                 }
             )
         except ConversationParticipant.DoesNotExist:
@@ -312,6 +328,22 @@ class UnmuteChatView(APIView):
 class DeleteChatView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
+    def get(self, request, chat_id):
+        try:
+            participant = ConversationParticipant.objects.get(
+                user=request.user, conversation_id=chat_id, deleted_at__isnull=True
+            )
+            return Response({
+                "chat_id": str(chat_id),
+                "title": "Delete Conversation",
+                "subtitle": "Delete this conversation permanently",
+                "action_url": f"/api/chats/{chat_id}/delete/",
+            })
+        except ConversationParticipant.DoesNotExist:
+            return Response(
+                {"detail": "Conversation not found."}, status=status.HTTP_404_NOT_FOUND
+            )
+
     def delete(self, request, chat_id):
         try:
             participant = ConversationParticipant.objects.get(
@@ -321,7 +353,14 @@ class DeleteChatView(APIView):
             participant.is_pinned = False
             participant.is_archived = False
             participant.save(update_fields=["deleted_at", "is_pinned", "is_archived"])
-            return Response({"detail": "Chat deleted successfully."})
+            return Response({
+                "chat_id": str(chat_id),
+                "detail": "Chat deleted successfully.",
+                "title": "Delete Conversation",
+                "subtitle": "Delete this conversation permanently",
+                "is_deleted": True,
+                "deleted_at": participant.deleted_at.isoformat(),
+            })
         except ConversationParticipant.DoesNotExist:
             return Response(
                 {"detail": "Conversation not found."}, status=status.HTTP_404_NOT_FOUND
@@ -735,9 +774,9 @@ class ChatSettingsView(APIView):
 
 class ChatPermissionsView(APIView):
     """
-    GET   /api/chats/<chat_id>/permissions/  - View permissions for this chat
-    POST  /api/chats/<chat_id>/permissions/  - Choose/update permissions for this chat
-    PATCH /api/chats/<chat_id>/permissions/  - Choose/update permissions for this chat
+    GET   /api/chats/<chat_id>/permissions/  - View permissions, sheets, and chips
+    POST  /api/chats/<chat_id>/permissions/  - Update permissions for this chat
+    PATCH /api/chats/<chat_id>/permissions/  - Update permissions for this chat
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -754,63 +793,145 @@ class ChatPermissionsView(APIView):
         if not participant:
             return Response({"detail": "Conversation not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        from .chat_permissions import get_chat_permissions_display
-        perms = get_chat_permissions_display(chat_id, request.user.id)
-
-        other_user = None
-        banner_text = "Members can"
-        if participant.conversation.type == "direct":
-            other = participant.conversation.participants.exclude(id=request.user.id).first()
-            if other:
-                first_name = (getattr(other, "first_name", "") or "").strip()
-                name = first_name or (getattr(other, "display_name", "") or other.username)
-                banner_text = f"{name} can"
-                from accounts.utils import visible_profile_fields
-                vis = visible_profile_fields(other, request.user)
-                photo_url = None
-                if getattr(other, "profile_photo", None) and vis.get("profile_photo", True):
-                    try:
-                        photo_url = request.build_absolute_uri(other.profile_photo.url)
-                    except Exception:
-                        pass
-                other_user = {
-                    "id": other.id,
-                    "first_name": first_name,
-                    "display_name": getattr(other, "display_name", other.username),
-                    "username": other.username,
-                    "profile_photo": photo_url,
-                    "is_online": other.is_online if vis.get("online_status", True) else None,
-                    "last_seen": other.last_seen.isoformat() if other.last_seen and vis.get("last_seen", True) else None,
-                    "banner_text": banner_text,
-                }
-
-        return Response({
-            "chat_id": str(chat_id),
-            "banner_text": banner_text,
-            "other_user": other_user,
-            "permissions": perms,
-            "chips": [
-                {"id": "message", "label": "Message", "enabled": perms.get("messages_enabled", True)},
-                {"id": "call", "label": "Call", "enabled": perms.get("calls_enabled", True)},
-                {"id": "media", "label": "Media", "enabled": perms.get("media_enabled", True)},
-            ],
-        })
+        from .chat_permissions import get_chat_connection_flow_data
+        flow_data = get_chat_connection_flow_data(chat_id, request.user, request=request)
+        return Response(flow_data)
 
     def patch(self, request, chat_id):
         participant = self._get_participant(request.user, chat_id)
         if not participant:
             return Response({"detail": "Conversation not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        from .chat_permissions import update_chat_permissions
-        perms = update_chat_permissions(chat_id, request.user.id, request.data)
+        from .chat_permissions import update_chat_permissions, get_chat_connection_flow_data
+        update_chat_permissions(chat_id, request.user.id, request.data)
+        flow_data = get_chat_connection_flow_data(chat_id, request.user, request=request)
         return Response({
-            "chat_id": str(chat_id),
             "detail": "Chat permissions updated successfully.",
-            "permissions": perms,
+            **flow_data,
         })
 
     def post(self, request, chat_id):
         return self.patch(request, chat_id)
+
+
+class ChatPermissionsAskView(APIView):
+    """
+    POST /api/chats/<chat_id>/permissions/ask/
+    Body: { "permission": "calls" | "media" }
+    Implements the 'Ask' button shown in Image 2.
+    Records that the current user asked Kabir to allow calls/media.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, chat_id):
+        try:
+            participant = ConversationParticipant.objects.select_related("conversation").get(
+                user=request.user, conversation_id=chat_id, deleted_at__isnull=True
+            )
+        except ConversationParticipant.DoesNotExist:
+            return Response({"detail": "Conversation not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        perm_type = request.data.get("permission", "calls")
+        from .chat_permissions import record_permission_request, get_chat_connection_flow_data
+        record_permission_request(chat_id, request.user.id, perm_type)
+
+        other = participant.conversation.participants.exclude(id=request.user.id).first()
+        other_name = (getattr(other, "first_name", "") or getattr(other, "display_name", "") or getattr(other, "username", "recipient")) if other else "recipient"
+        my_name = getattr(request.user, "display_name", "") or getattr(request.user, "first_name", "") or request.user.username
+
+        from .models import Message
+        from .utils import broadcast_chat_message
+        sys_content = f"{my_name} requested permission for {perm_type}."
+        try:
+            sys_msg = Message.objects.create(
+                conversation=participant.conversation,
+                sender=request.user,
+                content=sys_content,
+                message_type="text",
+            )
+            broadcast_chat_message(chat_id, sys_msg)
+        except Exception:
+            pass
+
+        flow_data = get_chat_connection_flow_data(chat_id, request.user, request=request)
+        return Response({
+            "chat_id": str(chat_id),
+            "detail": f"Request sent to {other_name}. They decide what to allow.",
+            "permission": perm_type,
+            "status": "requested",
+            **flow_data,
+        })
+
+
+class ChatPermissionsSetupView(APIView):
+    """
+    POST /api/chats/<chat_id>/permissions/setup/
+    Implements the bottom sheet actions from Image 1:
+    - 'Keep messages only': calls=False, media=False
+    - 'Allow selected': sets calls/media choices
+    - 'Decide later': leaves current choices, completes setup modal
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, chat_id):
+        try:
+            participant = ConversationParticipant.objects.select_related("conversation").get(
+                user=request.user, conversation_id=chat_id, deleted_at__isnull=True
+            )
+        except ConversationParticipant.DoesNotExist:
+            return Response({"detail": "Conversation not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        action = request.data.get("action")
+        calls_enabled = request.data.get("calls_enabled") if "calls_enabled" in request.data else request.data.get("calls")
+        media_enabled = request.data.get("media_enabled") if "media_enabled" in request.data else request.data.get("media")
+
+        from .chat_permissions import complete_chat_permission_setup, get_chat_connection_flow_data
+        complete_chat_permission_setup(
+            chat_id, request.user.id, action=action, calls_enabled=calls_enabled, media_enabled=media_enabled
+        )
+
+        flow_data = get_chat_connection_flow_data(chat_id, request.user, request=request)
+        return Response({
+            "chat_id": str(chat_id),
+            "detail": "Connection permissions configured successfully.",
+            "action": action,
+            **flow_data,
+        })
+
+
+class ChatRecipientProfileCardView(APIView):
+    """
+    GET /api/chats/<chat_id>/profile-card/
+    GET /api/chats/<chat_id>/contact-info/
+    Returns the Profile Card modal shown in Image 3:
+    - Avatar image
+    - Name: 'Kabir Mehta'
+    - Handle: '@kabir.m'
+    - Occupation: 'PRODUCT DESIGNER'
+    - Location: '📍 Pune'
+    - Quote: '“Sketching interfaces between chai breaks.”'
+    - Action buttons: 'Chat', 'Share'
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, chat_id):
+        try:
+            participant = ConversationParticipant.objects.select_related("conversation").get(
+                user=request.user, conversation_id=chat_id, deleted_at__isnull=True
+            )
+        except ConversationParticipant.DoesNotExist:
+            return Response({"detail": "Conversation not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if participant.conversation.type != "direct":
+            return Response({"detail": "Profile card is only supported in direct chats."}, status=status.HTTP_400_BAD_REQUEST)
+
+        other = participant.conversation.participants.exclude(id=request.user.id).first()
+        if not other:
+            return Response({"detail": "Recipient not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        from .chat_permissions import get_recipient_profile_card
+        data = get_recipient_profile_card(other, requesting_user=request.user, conversation_id=chat_id, request=request)
+        return Response(data)
 
 def guard_message_send(request, conversation):
     """Shared abuse checks for every outbound-message path. Returns a Response on failure."""

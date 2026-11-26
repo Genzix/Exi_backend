@@ -1136,13 +1136,14 @@ class FavoriteChatsView(APIView):
 class FavoriteChatToggleView(APIView):
     """
     GET  /api/chats/<chat_id>/favorite/ - Get favorite status
-    POST /api/chats/<chat_id>/favorite/ - Toggle a chat as favorite
+    POST /api/chats/<chat_id>/favorite/ - Toggle or set a chat as favorite
+         Body (optional): { "is_favorited": true|false } OR { "action": "favorite"|"unfavorite"|"toggle" }
     """
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, chat_id):
         try:
-            ConversationParticipant.objects.get(
+            participant = ConversationParticipant.objects.get(
                 user=request.user, conversation_id=chat_id, deleted_at__isnull=True
             )
         except ConversationParticipant.DoesNotExist:
@@ -1152,35 +1153,61 @@ class FavoriteChatToggleView(APIView):
         prefs = get_section_preferences(request.user.id, "favorites") or {}
         ids = prefs.get("chat_ids", [])
         cid = str(chat_id)
+        is_fav = (cid in ids) or bool(participant.is_pinned)
         return Response({
             "chat_id": cid,
-            "is_favorited": cid in ids,
+            "title": "Favourite Chat",
+            "subtitle": "Quick access on home screen",
+            "is_favorited": is_fav,
+            "value": is_fav,
+            "status": "on" if is_fav else "off",
         })
 
     def post(self, request, chat_id):
         try:
-            ConversationParticipant.objects.get(
+            participant = ConversationParticipant.objects.get(
                 user=request.user, conversation_id=chat_id, deleted_at__isnull=True
             )
         except ConversationParticipant.DoesNotExist:
             return Response({"detail": "Conversation not found."}, status=status.HTTP_404_NOT_FOUND)
 
         from accounts.user_preferences import get_section_preferences, update_section_preferences
-        prefs = get_section_preferences(request.user.id, "favorites")
-        ids = prefs.get("chat_ids", [])
+        prefs = get_section_preferences(request.user.id, "favorites") or {}
+        ids = list(prefs.get("chat_ids", []))
         cid = str(chat_id)
 
-        if cid in ids:
-            ids.remove(cid)
+        req_data = request.data if hasattr(request, "data") and isinstance(request.data, dict) else {}
+        action = req_data.get("action")
+        is_fav_param = req_data.get("is_favorited") if "is_favorited" in req_data else req_data.get("favorite")
+
+        if is_fav_param is not None:
+            is_favorited = str(is_fav_param).lower() in ("true", "1", "yes", "on")
+        elif action == "favorite":
+            is_favorited = True
+        elif action == "unfavorite":
             is_favorited = False
         else:
-            ids.append(cid)
-            is_favorited = True
+            is_favorited = not ((cid in ids) or bool(participant.is_pinned))
 
+        if is_favorited:
+            if cid not in ids:
+                ids.append(cid)
+            participant.is_pinned = True
+        else:
+            if cid in ids:
+                ids.remove(cid)
+            participant.is_pinned = False
+
+        participant.save(update_fields=["is_pinned"])
         update_section_preferences(request.user.id, "favorites", {"chat_ids": ids})
+
         return Response({
             "chat_id": cid,
+            "title": "Favourite Chat",
+            "subtitle": "Quick access on home screen",
             "is_favorited": is_favorited,
+            "value": is_favorited,
+            "status": "on" if is_favorited else "off",
             "detail": f"Chat {'added to' if is_favorited else 'removed from'} favorites.",
         })
 
