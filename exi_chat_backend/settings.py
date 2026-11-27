@@ -22,12 +22,16 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY')
+SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY') or 'django-insecure-fallback-key-exi-chat-backend-2026'
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = False
+DEBUG = os.environ.get('DJANGO_DEBUG', 'False').lower() in ('true', '1', 'yes')
 
-ALLOWED_HOSTS = ['exi.genzix.space', '103.178.160.171', 'localhost', '127.0.0.1']
+# Return OTP / reset codes in API responses while email/SMS delivery is not configured.
+# Set RETURN_DEBUG_OTP=False in production once real SMS/Email delivery is active.
+RETURN_DEBUG_OTP = os.environ.get('RETURN_DEBUG_OTP', 'True').lower() in ('true', '1', 'yes')
+
+ALLOWED_HOSTS = ['exi.genzix.space', '103.178.160.171', 'localhost', '127.0.0.1', 'testserver']
 
 
 # Application definition
@@ -222,7 +226,7 @@ SESSION_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SAMESITE = 'Lax'
 CSRF_COOKIE_SAMESITE = 'Lax'
 
-SECURE_SSL_REDIRECT = True
+SECURE_SSL_REDIRECT = os.environ.get('SECURE_SSL_REDIRECT', 'False').lower() in ('true', '1')
 SESSION_COOKIE_SECURE = not DEBUG
 CSRF_COOKIE_SECURE = not DEBUG
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')

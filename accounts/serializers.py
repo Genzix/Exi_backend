@@ -183,7 +183,7 @@ class ForgotPasswordSerializer(serializers.Serializer):
             uid = urlsafe_base64_encode(force_bytes(user.pk))
             token = reset_tokens.make_token(user)
             print(f"[reset email] uid={uid} token={token}")
-            if django_settings.DEBUG:
+            if django_settings.DEBUG or getattr(django_settings, "RETURN_DEBUG_OTP", False):
                 message["uid"] = uid
                 message["token"] = token
             return message
@@ -197,7 +197,7 @@ class ForgotPasswordSerializer(serializers.Serializer):
             update_fields=["reset_code", "reset_code_expires", "reset_code_attempts"]
         )
         print(f"[reset phone] code={code}")
-        if django_settings.DEBUG:
+        if django_settings.DEBUG or getattr(django_settings, "RETURN_DEBUG_OTP", False):
             message["code"] = code
         return message
 
@@ -504,7 +504,7 @@ class PhoneChangeRequestSerializer(serializers.Serializer):
         )
         print(f"[phone change OTP] phone={phone} code={code}")
         response_data = {"detail": "Verification code sent to new phone number."}
-        if django_settings.DEBUG:
+        if django_settings.DEBUG or getattr(django_settings, "RETURN_DEBUG_OTP", False):
             response_data["code"] = code
         return response_data
 
@@ -609,7 +609,7 @@ class SendOTPSerializer(serializers.Serializer):
         print(f"[Send OTP] To {identifier}: {code}")
 
         response = {"detail": "OTP sent successfully."}
-        if django_settings.DEBUG:
+        if django_settings.DEBUG or getattr(django_settings, "RETURN_DEBUG_OTP", False):
             response["otp_code"] = code
         return response
 
