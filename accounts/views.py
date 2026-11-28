@@ -240,7 +240,13 @@ class SendOTPView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
-        identifier = str(request.data.get("email_or_phone") or "").strip().lower()
+        identifier = str(
+            request.data.get("email_or_phone")
+            or request.data.get("phone")
+            or request.data.get("phone_number")
+            or request.data.get("email")
+            or ""
+        ).strip().lower()
 
         allowed, retry_after = throttle_request(request, "send-otp", limit=10, window_seconds=3600)
         if not allowed:
@@ -5784,8 +5790,9 @@ class EditProfileView(APIView):
             user.display_name = str(data["display_name"]).strip()[:50]
         if "full_name" in data:
             user.full_name = str(data["full_name"]).strip()[:100]
-        if "bio" in data:
-            user.bio = str(data["bio"]).strip()[:160]
+        if "bio" in data or "about" in data:
+            about_val = data.get("about") if "about" in data else data.get("bio")
+            user.bio = str(about_val or "").strip()[:160]
         if "status_message" in data:
             user.status_message = str(data["status_message"]).strip()[:100]
 
@@ -5802,8 +5809,12 @@ class EditProfileView(APIView):
 
         user.save()
 
-        # Handle occupation / headline and location / city dynamically in user profile preferences
+        # Handle occupation / headline / profession / designation and location / city dynamically in user profile preferences
         profile_updates = {}
+        if "profession" in data or "designation" in data:
+            prof = str(data.get("designation") if "designation" in data else data.get("profession") or "").strip()[:100]
+            profile_updates["profession"] = prof
+            profile_updates["designation"] = prof
         if "occupation" in data or "headline" in data or "job_title" in data:
             occ = str(data.get("occupation") or data.get("headline") or data.get("job_title", "")).strip()[:100]
             profile_updates["occupation"] = occ

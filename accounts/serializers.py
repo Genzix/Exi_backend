@@ -45,8 +45,24 @@ def split_email_or_phone(value):
 
 # ---------- Profile responses ----------
 
+def _get_profile_profession(user):
+    from .user_preferences import get_section_preferences
+
+    prefs = get_section_preferences(user.id, "profile") or {}
+    return (
+        prefs.get("designation")
+        or prefs.get("profession")
+        or prefs.get("occupation")
+        or prefs.get("headline")
+        or ""
+    )
+
+
 class ProfileSerializer(serializers.ModelSerializer):
     live_note = serializers.SerializerMethodField()
+    profession = serializers.SerializerMethodField()
+    designation = serializers.SerializerMethodField()
+    about = serializers.CharField(source="bio", read_only=True)
 
     class Meta:
         model = User
@@ -62,6 +78,9 @@ class ProfileSerializer(serializers.ModelSerializer):
             "is_online",
             "last_seen",
             "bio",
+            "about",
+            "profession",
+            "designation",
             "status_message",
             "live_note",
             "is_business",
@@ -72,6 +91,12 @@ class ProfileSerializer(serializers.ModelSerializer):
             "date_joined",
         ]
         read_only_fields = fields
+
+    def get_profession(self, obj):
+        return _get_profile_profession(obj)
+
+    def get_designation(self, obj):
+        return _get_profile_profession(obj)
 
     def get_live_note(self, obj):
         from .live_notes import get_live_note
@@ -122,6 +147,9 @@ class PrivacyMaskedProfileMixin(serializers.Serializer):
 class PublicProfileSerializer(PrivacyMaskedProfileMixin, serializers.ModelSerializer):
     """Public view of a profile, masked according to the owner's privacy settings."""
     live_note = serializers.SerializerMethodField()
+    profession = serializers.SerializerMethodField()
+    designation = serializers.SerializerMethodField()
+    about = serializers.SerializerMethodField()
 
     class Meta:
         model = User
@@ -135,6 +163,9 @@ class PublicProfileSerializer(PrivacyMaskedProfileMixin, serializers.ModelSerial
             "is_online",
             "last_seen",
             "bio",
+            "about",
+            "profession",
+            "designation",
             "status_message",
             "live_note",
             "is_business",
@@ -142,6 +173,15 @@ class PublicProfileSerializer(PrivacyMaskedProfileMixin, serializers.ModelSerial
             "business_address",
             "business_website",
         ]
+
+    def get_profession(self, obj):
+        return _get_profile_profession(obj)
+
+    def get_designation(self, obj):
+        return _get_profile_profession(obj)
+
+    def get_about(self, obj):
+        return self.get_bio(obj)
 
     def get_live_note(self, obj):
         from .live_notes import get_live_note
@@ -285,66 +325,120 @@ class ResetPasswordSerializer(serializers.Serializer):
 # ---------- Screen 2: Registration ----------
 
 class RegisterSerializer(serializers.Serializer):
+    phone = serializers.CharField(max_length=20)
     full_name = serializers.CharField(max_length=100)
-    email_or_phone = serializers.CharField(max_length=255)
-    password = serializers.CharField(write_only=True, min_length=8)
-    password_confirm = serializers.CharField(write_only=True)
+    display_name = serializers.CharField(max_length=50, required=False, allow_blank=True, default="")
+    email = serializers.EmailField(required=False, allow_blank=True, allow_null=True, default=None)
+    password = serializers.CharField(
+        write_only=True, required=False, allow_blank=True, allow_null=True, default=None
+    )
+    password_confirm = serializers.CharField(
+        write_only=True, required=False, allow_blank=True, allow_null=True, default=None
+    )
+    designation = serializers.CharField(max_length=100, required=False, allow_blank=True, default="")
+    profession = serializers.CharField(max_length=100, required=False, allow_blank=True, default="")
+    about = serializers.CharField(max_length=160, required=False, allow_blank=True, default="")
+    bio = serializers.CharField(max_length=160, required=False, allow_blank=True, default="")
 
     def to_internal_value(self, data):
-        data = data.copy() if hasattr(data, 'copy') else dict(data)
-        if 'email_or_phone' not in data or not data.get('email_or_phone'):
-            data['email_or_phone'] = data.get('email') or data.get('phone') or ''
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        if not data.get("phone"):
+            if data.get("phone_number"):
+                data["phone"] = data["phone_number"]
+            elif data.get("email_or_phone") and "@" not in str(data["email_or_phone"]):
+                data["phone"] = data["email_or_phone"]
         return super().to_internal_value(data)
 
+    def validate_phone(self, value):
+        phone = normalize_phone(value)
+        if len(phone) < 8:
+            raise serializers.ValidationError("Enter a valid phone number.")
+        if User.objects.filter(phone=phone).exists():
+            raise serializers.ValidationError("Phone already registered.")
+        return phone
+
+    def validate_email(self, value):
+        if not value or not str(value).strip():
+            return None
+        email = str(value).strip().lower()
+        if User.objects.filter(email__iexact=email).exists():
+            raise serializers.ValidationError("Email already registered.")
+        return email
+
     def validate_full_name(self, value):
-        value = value.strip()
+        value = (value or "").strip()
         if len(value) < 2:
             raise serializers.ValidationError("Enter your full name.")
         return value
 
     def validate(self, data):
-        if data["password"] != data["password_confirm"]:
-            raise serializers.ValidationError({"password_confirm": "Passwords do not match."})
-        validate_password(data["password"])
+        password = data.get("password") or None
+        password_confirm = data.get("password_confirm") or None
 
-        email, phone = split_email_or_phone(data["email_or_phone"])
-        identifier = email or phone
+        if password_confirm and not password:
+            raise serializers.ValidationError(
+                {"password": "Password is required when password_confirm is provided."}
+            )
+        if password:
+            if len(password) < 8:
+                raise serializers.ValidationError(
+                    {"password": "Ensure this field has at least 8 characters."}
+                )
+            if password_confirm is not None and password != password_confirm:
+                raise serializers.ValidationError({"password_confirm": "Passwords do not match."})
+            validate_password(password)
+        data["password"] = password
 
-        if email and User.objects.filter(email__iexact=email).exists():
-            raise serializers.ValidationError({"email_or_phone": "Email already registered."})
-        if phone and User.objects.filter(phone=phone).exists():
-            raise serializers.ValidationError({"email_or_phone": "Phone already registered."})
-
+        phone = data["phone"]
         try:
-            otp_obj = OTPVerification.objects.get(email_or_phone=identifier)
+            otp_obj = OTPVerification.objects.get(email_or_phone=phone)
         except OTPVerification.DoesNotExist:
             raise serializers.ValidationError(
-                {"email_or_phone": "Please verify OTP before registering."}
+                {"phone": "Please verify OTP before registering."}
             )
         if not otp_obj.is_verified:
             raise serializers.ValidationError(
-                {"email_or_phone": "Please verify OTP before registering."}
+                {"phone": "Please verify OTP before registering."}
             )
         if otp_obj.expires_at < timezone.now():
             raise serializers.ValidationError(
-                {"email_or_phone": "OTP verification expired. Request a new OTP."}
+                {"phone": "OTP verification expired. Request a new OTP."}
             )
 
-        data["email"] = email
-        data["phone"] = phone
+        data["profession"] = (data.get("designation") or data.get("profession") or "").strip()[:100]
+        data["bio"] = (data.get("about") or data.get("bio") or "").strip()[:160]
+        full_name = data.get("full_name", "")
+        data["display_name"] = ((data.get("display_name") or "").strip() or full_name)[:50]
         data["otp_obj"] = otp_obj
         return data
 
     def create(self, data):
+        from .user_preferences import update_section_preferences
+
+        phone = data["phone"]
+        username = phone if not User.objects.filter(username=phone).exists() else f"{phone}_{secrets.token_hex(2)}"
         user = User(
-            email=data["email"],
-            phone=data["phone"],
-            full_name=data["full_name"],
-            display_name=self.initial_data.get("display_name", "") or data["full_name"],
-            username=data["email"] or data["phone"],
+            email=data.get("email"),
+            phone=phone,
+            full_name=data.get("full_name", ""),
+            display_name=data.get("display_name", ""),
+            bio=data.get("bio", ""),
+            username=username,
         )
-        user.set_password(data["password"])
+        if data.get("password"):
+            user.set_password(data["password"])
+        else:
+            user.set_unusable_password()
         user.save()
+
+        profession = data.get("profession", "")
+        if profession:
+            update_section_preferences(
+                user.id,
+                "profile",
+                {"profession": profession, "designation": profession},
+            )
+
         data["otp_obj"].delete()
         return user
 
@@ -378,6 +472,9 @@ class ProfileSetupSerializer(serializers.ModelSerializer):
 # ---------- Edit profile later ----------
 
 class ProfileUpdateSerializer(serializers.ModelSerializer):
+    profession = serializers.CharField(max_length=100, required=False, allow_blank=True, write_only=True)
+    designation = serializers.CharField(max_length=100, required=False, allow_blank=True, write_only=True)
+
     class Meta:
         model = User
         fields = [
@@ -387,12 +484,41 @@ class ProfileUpdateSerializer(serializers.ModelSerializer):
             "display_name",
             "profile_photo",
             "bio",
+            "profession",
+            "designation",
             "status_message",
             "is_business",
             "business_name",
             "business_address",
             "business_website",
         ]
+
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        if "about" in data and "bio" not in data:
+            data["bio"] = data["about"]
+        return super().to_internal_value(data)
+
+    def update(self, instance, validated_data):
+        has_prof = False
+        prof_val = ""
+        if "designation" in validated_data:
+            prof_val = validated_data.pop("designation")
+            has_prof = True
+        if "profession" in validated_data:
+            prof_val = validated_data.pop("profession")
+            has_prof = True
+
+        user = super().update(instance, validated_data)
+        if has_prof:
+            from .user_preferences import update_section_preferences
+            clean_prof = str(prof_val or "").strip()[:100]
+            update_section_preferences(
+                user.id,
+                "profile",
+                {"profession": clean_prof, "designation": clean_prof},
+            )
+        return user
 
     def validate_username(self, value):
         if not value:
@@ -578,6 +704,12 @@ class OnlineStatusSerializer(serializers.Serializer):
 class SendOTPSerializer(serializers.Serializer):
     email_or_phone = serializers.CharField(max_length=255)
 
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        if not data.get("email_or_phone"):
+            data["email_or_phone"] = data.get("phone") or data.get("phone_number") or data.get("email") or ""
+        return super().to_internal_value(data)
+
     def validate(self, data):
         email, phone = split_email_or_phone(data["email_or_phone"])
         data["email_or_phone"] = email or phone
@@ -617,6 +749,12 @@ class SendOTPSerializer(serializers.Serializer):
 class VerifyOTPSerializer(serializers.Serializer):
     email_or_phone = serializers.CharField(max_length=255)
     otp_code = serializers.CharField(max_length=6)
+
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        if not data.get("email_or_phone"):
+            data["email_or_phone"] = data.get("phone") or data.get("phone_number") or data.get("email") or ""
+        return super().to_internal_value(data)
 
     def validate(self, data):
         email, phone = split_email_or_phone(data["email_or_phone"])
